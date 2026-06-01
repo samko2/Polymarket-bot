@@ -1,4 +1,4 @@
-import os, time, logging, requests, re
+import os, time, logging, requests, re, math
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 load_dotenv(dotenv_path=os.path.expanduser("~/Desktop/poly/.env"))
@@ -6,21 +6,49 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("btc_bot")
 API_KEY = os.getenv("POLYMARKET_API_KEY","")
 API_KEY_ADDRESS = os.getenv("POLYMARKET_API_KEY_ADDRESS","")
-MAX_BET_USDC = 5.0
-MIN_EDGE = 0.04
-POLL_INTERVAL = 60
+MAX_BET_USDC = 2.0
+MIN_EDGE = 0.025
+POLL_INTERVAL = 15
+MIN_VOLUME = 50000
 DRY_RUN = False
 CLOB_HOST = "https://clob.polymarket.com"
 GAMMA_HOST = "https://gamma-api.polymarket.com"
 EVENT_SLUG = "what-price-will-bitcoin-hit-before-2027"
+END_DATE = datetime(2026, 12, 31, 23, 59, tzinfo=timezone.utc)
+BTC_VOL = 0.60
+
+def norm_cdf(x):
+    return 0.5 * math.erfc(-x / math.sqrt(2))
+
+def bs_prob(S, K, T, sigma, direction="up"):
+    if T <= 0 or S <= 0 or K <= 0:
+        return None
+    lnSK = math.log(S / K)
+    sT = sigma * math.sqrt(T)
+    if direction == "up":
+        if K <= S:
+            prob = 0.97
+        else:
+            prob = 2 * norm_cdf(lnSK / sT)
+    else:
+        if K >= S:
+            prob = 0.97
+        else:
+            prob = 2 * norm_cdf(-lnSK / sT)
+    return round(min(0.97, max(0.02, prob)), 4)
 
 def get_btc_price():
-    try:
-        r = requests.get("https://api.coingecko.com/api/v3/simple/price",params={"ids":"bitcoin","vs_currencies":"usd"},timeout=10)
-        return r.json()["bitcoin"]["usd"]
-    except Exception as e:
-        log.warning(f"Price fetch failed: {e}")
-        return None
+    for fn in [
+        lambda: requests.get("https://api.coingecko.com/api/v3/simple/price",params={"ids":"bitcoin","vs_currencies":"usd"},timeout=10).json()["bitcoin"]["usd"],
+        lambda: float(requests.get("https://api.binance.com/api/v3/ticker/price",params={"symbol":"BTCUSDT"},timeout=10).json()["price"]),
+        lambda: float(requests.get("https://api.coincap.io/v2/assets/bitcoin",timeout=10).json()["data"]["priceUsd"]),
+    ]:
+        try:
+            return fn()
+        except:
+            continue
+    log.warning("All price sources failed")
+    return None
 
 def get_markets():
     try:
@@ -46,24 +74,22 @@ def get_order_book(token_id):
 def compute_fair(question, btc_price):
     up = re.search(r"[\u2191\+]\s*([0-9,]+)", question)
     down = re.search(r"[\u2193\-]\s*([0-9,]+)", question)
+    now = datetime.now(timezone.utc)
+    T = max(1/365, (END_DATE - now).days / 365)
     if up:
         strike = float(up.group(1).replace(",",""))
-        ratio = btc_price / strike
-        fair = min(0.97, 0.70+(ratio-1.0)*0.2) if ratio >= 1.0 else max(0.02, ratio*0.70)
-        return round(fair,4), "UP", strike
+        return bs_prob(btc_price, strike, T, BTC_VOL, "up"), "UP", strike
     elif down:
         strike = float(down.group(1).replace(",",""))
-        ratio = btc_price / strike
-        fair = min(0.97, 0.70+(1.0-ratio)*0.2) if ratio <= 1.0 else max(0.02, (1/ratio)*0.70)
-        return round(fair,4), "DOWN", strike
+        return bs_prob(btc_price, strike, T, BTC_VOL, "down"), "DOWN", strike
     return None, None, None
 
 def place_order(token_id, side, price, size_usdc):
+    import json
     size = round(size_usdc / price, 2)
-    log.info(f"{'[DRY RUN] ' if DRY_RUN else ''}ORDER: {side} {size} shares @ ${price:.4f}")
+    log.info(f"ORDER: {side} {size} shares @ ${price:.4f}")
     if DRY_RUN:
         return
-    import json
     body = json.dumps({"token_id":token_id,"price":str(price),"size":str(size),"side":side,"type":"GTC"})
     headers = {"POLY_ADDRESS":API_KEY_ADDRESS,"RELAYER_API_KEY":API_KEY,"Content-Type":"application/json"}
     try:
@@ -73,7 +99,8 @@ def place_order(token_id, side, price, size_usdc):
         log.error(f"Order failed: {e}")
 
 def run():
-    log.info("BTC 2026 Price Bot - " + ("LIVE" if not DRY_RUN else "DRY RUN"))
+    log.info("BTC Volatility Bot - " + ("LIVE" if not DRY_RUN else "DRY RUN"))
+    log.info(f"edge={MIN_EDGE*100}% vol={BTC_VOL*100}% bet=${MAX_BET_USDC} poll={POLL_INTERVAL}s")
     while True:
         btc = get_btc_price()
         if not btc:
@@ -81,11 +108,12 @@ def run():
             continue
         log.info(f"BTC=${btc:,.0f}")
         markets = get_markets()
-        log.info(f"Found {len(markets)} outcomes")
+        signals = 0
         for m in markets:
             question = m.get("question","")
             tokens = m.get("clobTokenIds") or []
-            if not tokens:
+            volume = float(m.get("volume","0") or 0)
+            if not tokens or volume < MIN_VOLUME:
                 continue
             token_id = tokens[0]
             fair, direction, strike = compute_fair(question, btc)
@@ -96,13 +124,17 @@ def run():
                 continue
             edge_buy = fair - ask
             edge_sell = bid - fair
-            log.info(f"{direction} ${strike:,.0f} bid={bid:.3f} ask={ask:.3f} fair={fair:.3f}")
+            log.info(f"{direction} ${strike:,.0f} vol=${volume:,.0f} bid={bid:.3f} ask={ask:.3f} fair={fair:.3f}")
             if edge_buy >= MIN_EDGE:
-                log.info(f"BUY signal! edge={edge_buy:.3f}")
+                log.info(f"*** BUY! edge={edge_buy:.3f} ***")
                 place_order(token_id,"BUY",ask,MAX_BET_USDC)
+                signals += 1
             elif edge_sell >= MIN_EDGE:
-                log.info(f"SELL signal! edge={edge_sell:.3f}")
+                log.info(f"*** SELL! edge={edge_sell:.3f} ***")
                 place_order(token_id,"SELL",bid,MAX_BET_USDC)
+                signals += 1
+        if signals == 0:
+            log.info("No edge found.")
         log.info(f"Sleeping {POLL_INTERVAL}s...")
         try:
             time.sleep(POLL_INTERVAL)
