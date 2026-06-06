@@ -1,13 +1,13 @@
 """
-Polymarket Ultimate Volatility Bot  —  Production-Ready
-════════════════════════════════════════════════════════
+Polymarket Ultimate Edge Bot  —  v2 Production
+═══════════════════════════════════════════════
 Assets   : BTC, ETH, SOL
-Pricing  : European digital (on-date) + barrier/touch (hit-before-date)
-Orders   : GTC limit orders placed at fair − edge_buffer; peer-to-peer fills
-Tracking : Fill detection via order polling; Telegram on every fill
-Sizing   : Live USDC balance → quarter-Kelly
-Safety   : Open-order dedup, stale order refresh, 6h hard reset
-Reports  : Daily Telegram P&L summary
+Pricing  : European digital + barrier/touch; vol term structure (7d/14d/30d)
+Orders   : GTC limits; order book cross-check; book-aware limit placement
+Sizing   : (bankroll − committed) → quarter-Kelly
+Safety   : Position awareness on start; exponential-backoff retries;
+           crash-proof loop with auto-restart; stale order refresh
+Alerts   : Telegram only on real fills and bot stop
 """
 
 import os
@@ -42,7 +42,7 @@ _handlers = [logging.StreamHandler()]
 try:
     _handlers.append(logging.FileHandler(os.path.expanduser("~/Desktop/poly/bot.log")))
 except OSError:
-    pass  # Railway: ~/Desktop/poly doesn't exist, stdout only is fine
+    pass
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s",
@@ -52,22 +52,26 @@ log = logging.getLogger("poly_bot")
 # ── Exchange ───────────────────────────────────────────────────────────────────
 CLOB_HOST  = "https://clob.polymarket.com"
 GAMMA_HOST = "https://gamma-api.polymarket.com"
+DATA_HOST  = "https://data-api.polymarket.com"
 CHAIN_ID   = 137
 TICK_SIZE  = "0.01"
 
 # ── Bot config ─────────────────────────────────────────────────────────────────
-DRY_RUN             = True    # ← flip to False for live trading
-POLL_INTERVAL       = 20      # seconds between scans
-EDGE_BUFFER         = 0.03    # how far below fair we place our limit (3%)
-MIN_EDGE            = 0.02    # minimum net edge after fee to bother placing
-TAKER_FEE           = 0.02    # Polymarket taker fee on winnings
-KELLY_FRACTION      = 0.25    # quarter-Kelly
-MAX_BET_USDC        = 1.0     # hard cap per order regardless of Kelly
-MIN_BET_USDC        = 0.50    # skip orders below this size
-MIN_VOLUME          = 5_000   # min lifetime volume to consider a market
-TRADED_RESET_HOURS  = 6       # cancel stale orders + full reset every N hours
-STALE_FAIR_DRIFT    = 0.12    # cancel + re-place if fair moved >12% from placement
-PNL_REPORT_HOURS    = 24      # Telegram P&L summary every N hours
+DRY_RUN               = True    # ← flip to False for live trading
+POLL_INTERVAL         = 20      # seconds between scans
+EDGE_BUFFER           = 0.03    # place limit this far below fair (3%)
+MIN_EDGE              = 0.02    # minimum net edge after fee
+TAKER_FEE             = 0.02    # Polymarket taker fee on winnings
+KELLY_FRACTION        = 0.25    # quarter-Kelly
+MAX_BET_USDC          = 1.0     # hard cap per order
+MIN_BET_USDC          = 0.50    # skip orders below this
+MIN_VOLUME            = 5_000   # min market lifetime volume
+TRADED_RESET_HOURS    = 6       # full reset every N hours
+STALE_FAIR_DRIFT      = 0.12    # cancel order if fair drifted >12%
+PNL_REPORT_HOURS      = 24
+MAX_MODEL_MARKET_GAP  = 0.30    # skip if model and book-mid disagree >30%
+MIN_BOOK_LIQUIDITY    = 0.01    # skip markets with spread wider than 99 cents
+MAX_POSITION_TOKENS   = 50      # max distinct token positions held at once
 
 # ── Telegram ───────────────────────────────────────────────────────────────────
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
@@ -133,52 +137,137 @@ ASSETS = {
 }
 
 # ── Caches ─────────────────────────────────────────────────────────────────────
-_slug_cache:  dict = {}   # slug  → (ts, [markets])
-_vol_cache:   dict = {}   # sym   → (ts, vol)
-_drift_cache: dict = {}   # sym   → (ts, drift)
-SLUG_TTL = 300            # seconds
+_slug_cache:  dict = {}
+_vol_cache:   dict = {}
+_drift_cache: dict = {}
+_book_cache:  dict = {}
+SLUG_TTL = 300
+BOOK_TTL = 15    # order books stale quickly
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ORDER MANAGER — tracks open orders, detects fills, refreshes stale orders
+# HTTP WITH RETRY + EXPONENTIAL BACKOFF
+# ══════════════════════════════════════════════════════════════════════════════
+
+def retry_get(url: str, params: dict = None, timeout: int = 10,
+              attempts: int = 3) -> requests.Response:
+    """GET with exponential backoff. Raises on final failure."""
+    delay = 2.0
+    for i in range(attempts):
+        try:
+            r = requests.get(url, params=params, timeout=timeout)
+            r.raise_for_status()
+            return r
+        except Exception as e:
+            if i == attempts - 1:
+                raise
+            log.debug(f"Request failed ({e}), retrying in {delay:.0f}s…")
+            time.sleep(delay)
+            delay *= 2
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ORDER BOOK
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_order_book(token_id: str) -> tuple[float, float, float, bool]:
+    """Returns (best_bid, best_ask, mid, liquid). Cached for BOOK_TTL seconds."""
+    now = time.time()
+    if token_id in _book_cache and now - _book_cache[token_id][0] < BOOK_TTL:
+        return _book_cache[token_id][1]
+    try:
+        data     = retry_get(f"{CLOB_HOST}/book", params={"token_id": token_id}, timeout=8).json()
+        bids     = data.get("bids", [])
+        asks     = data.get("asks", [])
+        best_bid = float(bids[0]["price"]) if bids else 0.0
+        best_ask = float(asks[0]["price"]) if asks else 1.0
+        mid      = round((best_bid + best_ask) / 2, 4)
+        liquid   = bool(bids and asks and (best_ask - best_bid) <= (1.0 - MIN_BOOK_LIQUIDITY))
+        result   = (best_bid, best_ask, mid, liquid)
+        _book_cache[token_id] = (now, result)
+        return result
+    except Exception:
+        return 0.0, 1.0, 0.5, False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# POSITION AWARENESS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_wallet_address(pk: str) -> str:
+    try:
+        from eth_account import Account
+        return Account.from_key(pk).address
+    except Exception:
+        return ""
+
+
+def get_existing_positions(wallet: str) -> set[str]:
+    """Fetch token IDs where we already hold a position. Skips these on entry."""
+    if not wallet:
+        return set()
+    try:
+        data = retry_get(
+            f"{DATA_HOST}/positions",
+            params={"user": wallet, "sizeThreshold": "0.01"},
+            timeout=12,
+        ).json()
+        held = set()
+        for p in (data if isinstance(data, list) else []):
+            tid  = p.get("asset") or p.get("token_id") or p.get("assetId", "")
+            size = float(p.get("size") or p.get("position") or 0)
+            if tid and size > 0.01:
+                held.add(tid)
+        log.info(f"  Existing positions loaded: {len(held)} token(s)")
+        return held
+    except Exception as e:
+        log.warning(f"Could not load positions: {e}")
+        return set()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ORDER MANAGER
 # ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class TrackedOrder:
-    order_id:   str
-    token_id:   str
-    label:      str
-    limit:      float
-    size_usdc:  float
-    fair:       float        # fair value when we placed the order
-    placed_at:  float = field(default_factory=time.time)
+    order_id:  str
+    token_id:  str
+    label:     str
+    limit:     float
+    size_usdc: float
+    fair:      float
+    placed_at: float = field(default_factory=time.time)
 
 
 class OrderManager:
-    def __init__(self):
-        self.orders:        dict[str, TrackedOrder] = {}   # order_id → TrackedOrder
-        self.open_token_ids: set[str] = set()              # token_ids with live orders
-        self.fills_usdc:    float = 0.0
-        self.fill_count:    int   = 0
-        self.order_count:   int   = 0
+    def __init__(self, existing_positions: set[str] = None):
+        self.orders:          dict[str, TrackedOrder] = {}
+        self.open_token_ids:  set[str] = set()
+        self.held_token_ids:  set[str] = existing_positions or set()  # from API on startup
+        self.fills_usdc:      float = 0.0
+        self.fill_count:      int   = 0
+        self.order_count:     int   = 0
 
     def record(self, order_id: str, token_id: str, label: str,
                limit: float, size_usdc: float, fair: float) -> None:
-        self.orders[order_id]   = TrackedOrder(order_id, token_id, label, limit, size_usdc, fair)
+        self.orders[order_id]  = TrackedOrder(order_id, token_id, label, limit, size_usdc, fair)
         self.open_token_ids.add(token_id)
-        self.order_count       += 1
+        self.order_count      += 1
 
     def has_open_order(self, token_id: str) -> bool:
         return token_id in self.open_token_ids
 
+    def already_holds(self, token_id: str) -> bool:
+        return token_id in self.held_token_ids
+
+    def committed_usdc(self) -> float:
+        """USDC locked in open (unfilled) orders."""
+        return sum(o.size_usdc for o in self.orders.values())
+
     def refresh_from_api(self, client: ClobClient) -> list[dict]:
-        """
-        Poll open orders from API.  Returns list of fill-event dicts.
-        Also refreshes open_token_ids so has_open_order() stays accurate.
-        """
         if DRY_RUN:
             return []
-
         fill_events = []
         try:
             open_orders = client.get_open_orders() or []
@@ -186,8 +275,7 @@ class OrderManager:
             open_tokens = {o.get("asset_id") for o in open_orders if o.get("asset_id")}
             self.open_token_ids = open_tokens
 
-            gone_ids = [oid for oid in self.orders if oid not in open_ids]
-            for oid in gone_ids:
+            for oid in [x for x in self.orders if x not in open_ids]:
                 tracked = self.orders.pop(oid)
                 try:
                     detail       = client.get_order(oid) or {}
@@ -197,39 +285,33 @@ class OrderManager:
                         filled_usdc = round(size_matched * tracked.limit, 2)
                         self.fills_usdc += filled_usdc
                         self.fill_count += 1
+                        self.held_token_ids.add(tracked.token_id)
                         fill_events.append({
-                            "label":       tracked.label,
-                            "limit":       tracked.limit,
-                            "fair":        tracked.fair,
+                            "label":        tracked.label,
+                            "limit":        tracked.limit,
+                            "fair":         tracked.fair,
                             "size_matched": size_matched,
-                            "filled_usdc": filled_usdc,
+                            "filled_usdc":  filled_usdc,
                             "edge_at_fill": tracked.fair * (1 - TAKER_FEE) - tracked.limit,
                         })
-                        log.info(f"  ✓ FILL: {tracked.label} {size_matched:.2f} shares @ {tracked.limit:.3f} = ${filled_usdc:.2f}")
+                        log.info(f"  ✓ FILL: {tracked.label} {size_matched:.2f}sh @ {tracked.limit:.3f} = ${filled_usdc:.2f}")
                     else:
                         log.info(f"  Order {oid[:10]} gone (status={status}, no fill)")
                 except Exception as e:
                     log.debug(f"  get_order {oid}: {e}")
-
         except Exception as e:
             log.warning(f"refresh_from_api failed: {e}")
-
         return fill_events
 
     def cancel_stale(self, client: ClobClient, current_fairs: dict[str, float]) -> None:
-        """
-        Cancel open orders where fair value has drifted >STALE_FAIR_DRIFT from placement.
-        current_fairs: token_id → current fair value
-        """
         if DRY_RUN:
             return
         for oid, tracked in list(self.orders.items()):
-            curr_fair = current_fairs.get(tracked.token_id)
-            if curr_fair is None:
+            curr = current_fairs.get(tracked.token_id)
+            if curr is None:
                 continue
-            drift = abs(curr_fair - tracked.fair)
-            if drift >= STALE_FAIR_DRIFT:
-                log.info(f"  Cancelling stale order {oid[:10]} (fair drifted {drift:.2f})")
+            if abs(curr - tracked.fair) >= STALE_FAIR_DRIFT:
+                log.info(f"  Cancelling stale {oid[:10]} (fair drifted {abs(curr-tracked.fair):.2f})")
                 try:
                     client.cancel_order(OrderPayload(orderID=oid))
                     self.orders.pop(oid, None)
@@ -242,27 +324,26 @@ class OrderManager:
             return
         try:
             client.cancel_all()
-            log.info(f"  Cancelled all open orders ({len(self.orders)} tracked)")
+            log.info(f"  Cancelled all ({len(self.orders)} tracked)")
         except Exception as e:
             log.warning(f"  cancel_all failed: {e}")
         self.orders.clear()
         self.open_token_ids.clear()
 
     def summary(self) -> str:
-        return (f"Orders placed: {self.order_count}  "
-                f"Fills: {self.fill_count}  "
-                f"USDC filled: ${self.fills_usdc:.2f}")
+        return (f"Orders: {self.order_count}  Fills: {self.fill_count}  "
+                f"Filled: ${self.fills_usdc:.2f}  Committed: ${self.committed_usdc():.2f}  "
+                f"Positions held: {len(self.held_token_ids)}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # LIVE USDC BALANCE
 # ══════════════════════════════════════════════════════════════════════════════
 
-_balance_cache: list = [0.0, 0.0]   # [value, fetched_at]
+_balance_cache: list = [0.0, 0.0]
 
 
 def get_usdc_balance(client: ClobClient) -> float:
-    """Fetch live USDC balance from Polymarket CLOB. Cached for 5 min."""
     now = time.time()
     if _balance_cache[1] and now - _balance_cache[1] < 300:
         return _balance_cache[0]
@@ -277,27 +358,47 @@ def get_usdc_balance(client: ClobClient) -> float:
         return balance
     except Exception as e:
         log.debug(f"Balance fetch failed: {e}")
-        return _balance_cache[0] or MAX_BET_USDC * 10   # fallback
+        return _balance_cache[0] or MAX_BET_USDC * 10
+
+
+def free_bankroll(bankroll: float, om: OrderManager) -> float:
+    """Bankroll minus USDC already committed to open orders."""
+    return max(0.0, bankroll - om.committed_usdc())
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LIVE VOL + DRIFT (Binance 30-day realized)
+# VOL + DRIFT WITH TERM STRUCTURE
 # ══════════════════════════════════════════════════════════════════════════════
 
-def get_live_vol(symbol: str, fallback: float) -> float:
-    now = time.time()
-    if symbol in _vol_cache and now - _vol_cache[symbol][0] < 3600:
-        return _vol_cache[symbol][1]
+def _fetch_realized_vol(symbol: str, interval: str, bars: int) -> float:
+    closes  = [float(c[4]) for c in retry_get(
+        "https://api.binance.com/api/v3/klines",
+        params={"symbol": symbol + "USDT", "interval": interval, "limit": bars + 1},
+        timeout=10,
+    ).json()]
+    returns = [math.log(closes[i] / closes[i - 1]) for i in range(1, len(closes))]
+    # Annualise: daily bars × √365, hourly bars × √(365×24)
+    ann     = math.sqrt(365 * 24) if interval == "1h" else math.sqrt(365)
+    return round((sum(r ** 2 for r in returns) / len(returns)) ** 0.5 * ann, 3)
+
+
+def get_live_vol(symbol: str, fallback: float, T_years: float = 1.0) -> float:
+    """Returns realized vol matched to the market's time horizon."""
+    if T_years < 14 / 365:
+        window, interval, label = 7,  "1h", "7d-hourly"
+    elif T_years < 60 / 365:
+        window, interval, label = 14, "1d", "14d-daily"
+    else:
+        window, interval, label = 30, "1d", "30d-daily"
+
+    cache_key = f"{symbol}_{window}{interval}"
+    now       = time.time()
+    if cache_key in _vol_cache and now - _vol_cache[cache_key][0] < 3600:
+        return _vol_cache[cache_key][1]
     try:
-        closes  = [float(c[4]) for c in requests.get(
-            "https://api.binance.com/api/v3/klines",
-            params={"symbol": symbol + "USDT", "interval": "1d", "limit": 31},
-            timeout=10,
-        ).json()]
-        returns = [math.log(closes[i] / closes[i - 1]) for i in range(1, len(closes))]
-        vol     = round((sum(r ** 2 for r in returns) / len(returns)) ** 0.5 * math.sqrt(365), 3)
-        _vol_cache[symbol] = (now, vol)
-        log.info(f"  Vol  {symbol}: {vol*100:.0f}%")
+        vol = _fetch_realized_vol(symbol, interval, window)
+        _vol_cache[cache_key] = (now, vol)
+        log.info(f"  Vol {symbol} ({label}): {vol*100:.0f}%")
         return vol
     except Exception:
         return fallback
@@ -308,7 +409,7 @@ def get_live_drift(symbol: str, fallback: float) -> float:
     if symbol in _drift_cache and now - _drift_cache[symbol][0] < 3600:
         return _drift_cache[symbol][1]
     try:
-        closes = [float(c[4]) for c in requests.get(
+        closes = [float(c[4]) for c in retry_get(
             "https://api.binance.com/api/v3/klines",
             params={"symbol": symbol + "USDT", "interval": "1d", "limit": 31},
             timeout=10,
@@ -338,9 +439,9 @@ def get_price(cg_id: str, sym: str) -> float | None:
     ]
     for fn in sources:
         try:
-            p = fn()
-            if p and float(p) > 0:
-                return float(p)
+            p = float(fn())
+            if p > 0:
+                return p
         except Exception:
             pass
     log.warning(f"All price sources failed for {sym}")
@@ -348,7 +449,7 @@ def get_price(cg_id: str, sym: str) -> float | None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SLUG + MARKET DISCOVERY
+# MARKET DISCOVERY
 # ══════════════════════════════════════════════════════════════════════════════
 
 def generate_daily_slugs(names: list) -> list:
@@ -379,7 +480,7 @@ def get_markets_for_slug(slug: str) -> list:
     if slug in _slug_cache and now - _slug_cache[slug][0] < SLUG_TTL:
         return _slug_cache[slug][1]
     try:
-        resp = requests.get(f"{GAMMA_HOST}/events", params={"slug": slug}, timeout=12)
+        resp = retry_get(f"{GAMMA_HOST}/events", params={"slug": slug}, timeout=12)
         data = resp.json()
         ms   = data[0].get("markets", []) if isinstance(data, list) and data else []
         _slug_cache[slug] = (now, ms)
@@ -391,10 +492,9 @@ def get_markets_for_slug(slug: str) -> list:
 
 def search_gamma(keyword: str, limit: int = 100) -> list:
     try:
-        resp = requests.get(f"{GAMMA_HOST}/markets",
+        data = retry_get(f"{GAMMA_HOST}/markets",
             params={"search": keyword, "active": "true", "closed": "false", "limit": limit},
-            timeout=15)
-        data = resp.json()
+            timeout=15).json()
         return data if isinstance(data, list) else data.get("markets", [])
     except Exception:
         return []
@@ -434,7 +534,6 @@ def norm_cdf(x: float) -> float:
 
 
 def european_prob(S, K, T, sigma, drift, direction) -> float | None:
-    """P(S_T > K) at expiry. For 'above $X on [date]' markets."""
     if T <= 0 or S <= 0 or K <= 0 or sigma <= 0: return None
     d2   = (math.log(S / K) + (drift - 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
     prob = norm_cdf(d2) if direction == "up" else norm_cdf(-d2)
@@ -442,13 +541,12 @@ def european_prob(S, K, T, sigma, drift, direction) -> float | None:
 
 
 def hit_probability(S, K, T, sigma, drift, direction) -> float | None:
-    """P(S touches K before T). For 'hit $X before [date]' markets."""
     if T <= 0 or S <= 0 or K <= 0 or sigma <= 0: return None
-    mu      = drift - 0.5 * sigma**2
-    sqT     = sigma * math.sqrt(T)
-    log_KS  = math.log(K / S)
-    d1, d2  = (log_KS - mu * T) / sqT, (log_KS + mu * T) / sqT
-    alpha   = 2 * mu / sigma**2
+    mu     = drift - 0.5 * sigma**2
+    sqT    = sigma * math.sqrt(T)
+    log_KS = math.log(K / S)
+    d1, d2 = (log_KS - mu * T) / sqT, (log_KS + mu * T) / sqT
+    alpha  = 2 * mu / sigma**2
     if direction == "up":
         prob = norm_cdf(-d1) + math.exp(alpha * log_KS) * norm_cdf(-d2)
     else:
@@ -460,17 +558,17 @@ def hit_probability(S, K, T, sigma, drift, direction) -> float | None:
 
 
 def is_touch_market(q: str) -> bool:
-    ql = q.lower()
+    ql      = q.lower()
     on_date = bool(re.search(
         r"\bon\s+(january|february|march|april|may|june|july|august"
         r"|september|october|november|december)\s+\d", ql))
-    eod = any(kw in ql for kw in ["end of day","end of week","end of month","end of hour","at end"])
+    eod   = any(kw in ql for kw in ["end of day","end of week","end of month","end of hour","at end"])
     touch = any(kw in ql for kw in ["before","by december","by end","by 2027","dip to","reach $","hit $"])
     return touch and not on_date and not eod
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# END DATE + QUESTION PARSING
+# QUESTION PARSING
 # ══════════════════════════════════════════════════════════════════════════════
 
 _MONTHS = {"january":1,"february":2,"march":3,"april":4,"may":5,"june":6,
@@ -514,7 +612,7 @@ def parse_question(q: str, spot: float, end_date: datetime) -> list:
     if m:
         lo, hi = _num(m.group(1)), _num(m.group(2))
         if lo > 0 and hi > 0:
-            return [{"direction":"up","strike":hi,"T":T},{"direction":"down","strike":lo,"T":T}]
+            return [{"direction":"up","strike":hi,"T":T}, {"direction":"down","strike":lo,"T":T}]
 
     sigs = []
     for pat in _UP_PATS:
@@ -532,7 +630,7 @@ def parse_question(q: str, spot: float, end_date: datetime) -> list:
     corrected = []
     for s in sigs:
         d = s["direction"]
-        if s["strike"] < spot * 0.97 and d == "up":   d = "down"
+        if s["strike"] < spot * 0.97 and d == "up":    d = "down"
         elif s["strike"] > spot * 1.03 and d == "down": d = "up"
         corrected.append({**s, "direction": d})
     return corrected
@@ -543,7 +641,6 @@ def parse_question(q: str, spot: float, end_date: datetime) -> list:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def kelly_buy(fair: float, limit: float, bankroll: float) -> float:
-    """Quarter-Kelly USDC size. Bankroll = live USDC balance."""
     if limit <= 0 or limit >= 1 or fair * (1 - TAKER_FEE) <= limit:
         return 0.0
     f_star = (fair * (1 - TAKER_FEE) - limit) / (1 - limit)
@@ -562,10 +659,13 @@ def build_client() -> ClobClient:
         creds = ApiCreds(api_key=ak, api_secret=sec, api_passphrase=pw)
         log.info("Using saved API credentials")
     else:
-        log.info("Deriving API credentials...")
+        log.info("Deriving API credentials from PK…")
         tmp   = ClobClient(host=CLOB_HOST, chain_id=CHAIN_ID, key=pk)
         creds = tmp.create_or_derive_api_key()
-        log.info(f"Save to .env:\n  CLOB_API_KEY={creds.api_key}\n  CLOB_SECRET={creds.api_secret}\n  CLOB_PASS_PHRASE={creds.api_passphrase}")
+        log.info(f"Tip — add these to Railway env vars to skip derivation:\n"
+                 f"  CLOB_API_KEY={creds.api_key}\n"
+                 f"  CLOB_SECRET={creds.api_secret}\n"
+                 f"  CLOB_PASS_PHRASE={creds.api_passphrase}")
     return ClobClient(host=CLOB_HOST, chain_id=CHAIN_ID, key=pk, creds=creds)
 
 
@@ -580,8 +680,7 @@ def place_order(client: ClobClient, om: OrderManager,
     if shares < 1:
         return False
 
-    prefix = "[DRY RUN] " if DRY_RUN else ""
-    log.info(f"{prefix}BUY LIMIT  {label}  {shares} shares @ {limit:.3f}  (${size_usdc:.2f})")
+    log.info(f"{'[DRY] ' if DRY_RUN else ''}BUY LIMIT  {label}  {shares}sh @ {limit:.3f}  (${size_usdc:.2f})")
 
     if DRY_RUN:
         return True
@@ -595,13 +694,15 @@ def place_order(client: ClobClient, om: OrderManager,
         )
         if resp and resp.get("success"):
             order_id = resp.get("orderID", "")
-            log.info(f"  ✓ Order placed: {order_id}")
-            tg(f"✅ <b>TRADE PLACED</b>  {label}\nBUY {shares} sh @ {limit:.3f}  (${size_usdc:.2f})\nFair: {fair:.3f}  Edge: {fair*(1-TAKER_FEE)-limit:+.3f}\nID: {order_id}")
+            log.info(f"  ✓ Placed: {order_id}")
+            tg(f"✅ <b>TRADE PLACED</b>  {label}\n"
+               f"BUY {shares}sh @ {limit:.3f}  (${size_usdc:.2f})\n"
+               f"Fair: {fair:.3f}  Edge: {fair*(1-TAKER_FEE)-limit:+.3f}\n"
+               f"ID: {order_id}")
             if order_id:
                 om.record(order_id, token_id, label, limit, size_usdc, fair)
             return True
-        else:
-            log.error(f"  ✗ Rejected: {resp}")
+        log.error(f"  ✗ Rejected: {resp}")
     except Exception as e:
         log.error(f"  ✗ Failed: {e}")
     return False
@@ -613,8 +714,7 @@ def place_order(client: ClobClient, om: OrderManager,
 
 def process_market(client: ClobClient, om: OrderManager,
                    market: dict, spot: float, asset: str,
-                   cfg: dict, vol: float, drift: float,
-                   bankroll: float) -> dict | None:
+                   cfg: dict, drift: float, bankroll: float) -> dict | None:
 
     question = market.get("question", "")
     volume   = float(market.get("volume") or 0)
@@ -631,6 +731,15 @@ def process_market(client: ClobClient, om: OrderManager,
     token_yes = raw[0]
     token_no  = raw[1] if len(raw) > 1 else None
 
+    # ── Skip if we already hold this position ──────────────────────────────────
+    if om.already_holds(token_yes) or (token_no and om.already_holds(token_no)):
+        return None
+
+    # ── Skip if we're at the position cap ─────────────────────────────────────
+    if len(om.held_token_ids) >= MAX_POSITION_TOKENS:
+        return None
+
+    # ── Parse question ─────────────────────────────────────────────────────────
     end_date = parse_end_date(question, cfg["end_date"])
     sigs     = parse_question(question, spot, end_date)
     if not sigs:
@@ -642,6 +751,10 @@ def process_market(client: ClobClient, om: OrderManager,
     if not (0.15 * spot < strike < 6.0 * spot):
         return None
 
+    # ── Vol matched to time horizon ────────────────────────────────────────────
+    vol = get_live_vol(cfg["binance_symbol"], cfg["vol"], T)
+
+    # ── Price model ───────────────────────────────────────────────────────────
     touch = is_touch_market(question)
     fair  = (hit_probability if touch else european_prob)(spot, strike, T, vol, drift, direction)
     if fair is None or not (0.10 < fair < 0.90):
@@ -650,28 +763,52 @@ def process_market(client: ClobClient, om: OrderManager,
     model = "touch" if touch else "euro"
     label = f"{asset} {direction.upper()} ${strike:,.0f} ({model}) T={T*365:.0f}d"
 
+    # ── Order book cross-check ─────────────────────────────────────────────────
+    bid, ask, book_mid, liquid = get_order_book(token_yes)
+    if not liquid:
+        return None  # dead market, no counterparty
+
+    book_fair = book_mid if fair >= 0.50 else 1 - book_mid
+    gap       = abs(fair - book_fair)
+    if gap > MAX_MODEL_MARKET_GAP:
+        # Model and market strongly disagree — likely bad question parse, skip
+        log.debug(f"  Skip {label[:40]}: model={fair:.2f} book={book_fair:.2f} gap={gap:.2f}")
+        return None
+
     result = dict(question=question[:65], direction=direction, strike=strike,
-                  fair=fair, volume=volume, T_days=T*365, model=model,
-                  action=None, traded=False, limit=0.0, net_edge=0.0, side="?")
+                  fair=fair, book_mid=book_mid, gap=gap, volume=volume,
+                  T_days=T*365, model=model, action=None, traded=False,
+                  limit=0.0, net_edge=0.0, side="?")
+
+    # ── Free bankroll = balance minus already-committed USDC ──────────────────
+    available = free_bankroll(bankroll, om)
 
     if fair >= 0.50:
-        # We think YES — BUY YES limit below fair
-        limit    = round(max(0.02, fair - EDGE_BUFFER), 2)
+        # BUY YES — limit below our fair, but at least 1 tick above best bid
+        limit    = round(max(bid + 0.01, fair - EDGE_BUFFER, 0.02), 2)
+        limit    = min(limit, ask - 0.01)  # never cross the spread
         net_edge = fair * (1 - TAKER_FEE) - limit
         result.update(limit=limit, net_edge=net_edge, side="YES")
         if net_edge >= MIN_EDGE and not om.has_open_order(token_yes):
-            size = kelly_buy(fair, limit, bankroll)
+            size = kelly_buy(fair, limit, available)
             if size >= MIN_BET_USDC:
                 if place_order(client, om, token_yes, limit, size, fair, label):
                     result.update(action=f"BUY YES @{limit:.2f} ${size:.2f}", traded=True)
     else:
-        # We think NO — BUY NO limit below (1-fair)
+        # BUY NO — use NO token's book
+        if token_no:
+            bid_no, ask_no, _, liquid_no = get_order_book(token_no)
+        else:
+            bid_no, ask_no, liquid_no = 0.0, 1.0, False
+
         fair_no  = 1 - fair
-        limit    = round(max(0.02, fair_no - EDGE_BUFFER), 2)
+        limit    = round(max(bid_no + 0.01, fair_no - EDGE_BUFFER, 0.02), 2)
+        if liquid_no:
+            limit = min(limit, ask_no - 0.01)
         net_edge = fair_no * (1 - TAKER_FEE) - limit
         result.update(limit=limit, net_edge=net_edge, side="NO")
         if net_edge >= MIN_EDGE and token_no and not om.has_open_order(token_no):
-            size = kelly_buy(fair_no, limit, bankroll)
+            size = kelly_buy(fair_no, limit, available)
             if size >= MIN_BET_USDC:
                 if place_order(client, om, token_no, limit, size, fair_no, f"{label} NO"):
                     result.update(action=f"BUY NO  @{limit:.2f} ${size:.2f}", traded=True)
@@ -680,29 +817,19 @@ def process_market(client: ClobClient, om: OrderManager,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# P&L REPORTER
+# P&L TRACKER
 # ══════════════════════════════════════════════════════════════════════════════
 
 class PnL:
     def __init__(self):
-        self.start      = datetime.now(timezone.utc)
+        self.start       = datetime.now(timezone.utc)
         self.last_report = time.time()
 
     def maybe_report(self, om: OrderManager, bankroll: float) -> None:
         if time.time() - self.last_report < PNL_REPORT_HOURS * 3600:
             return
         uptime = str(datetime.now(timezone.utc) - self.start).split(".")[0]
-        msg = (
-            f"📊 <b>Daily Summary</b>\n"
-            f"Uptime: {uptime}\n"
-            f"Orders placed: {om.order_count}\n"
-            f"Fills: {om.fill_count}\n"
-            f"USDC filled: ${om.fills_usdc:.2f}\n"
-            f"Open orders: {len(om.orders)}\n"
-            f"Current balance: ${bankroll:.2f}\n"
-            f"(Check Polymarket dashboard for full P&L)"
-        )
-        log.info(msg.replace("<b>", "").replace("</b>", ""))
+        log.info(f"[24h] uptime={uptime} {om.summary()} balance=${bankroll:.2f}")
         self.last_report = time.time()
 
 
@@ -710,49 +837,39 @@ class PnL:
 # MAIN LOOP
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run() -> None:
-    mode = "*** DRY RUN ***" if DRY_RUN else "*** LIVE TRADING ***"
-    log.info("=" * 72)
-    log.info(f"Polymarket Ultimate Bot  —  {mode}")
-    log.info(f"Assets: BTC · ETH · SOL  |  edge={EDGE_BUFFER*100:.0f}%  min={MIN_EDGE*100:.1f}%  fee={TAKER_FEE*100:.0f}%  Kelly={KELLY_FRACTION}  max=${MAX_BET_USDC}")
-    log.info(f"Telegram: {'enabled ✓' if TG_TOKEN else 'disabled ✗'}")
-    log.info("=" * 72)
-
-    client = build_client()
-    om     = OrderManager()
-    pnl    = PnL()
+def run_loop(client: ClobClient, wallet: str) -> None:
+    """Inner loop — runs until KeyboardInterrupt or unrecoverable error."""
+    om  = OrderManager(get_existing_positions(wallet))
+    pnl = PnL()
 
     bankroll   = get_usdc_balance(client) if not DRY_RUN else MAX_BET_USDC * 20
     last_reset = time.time()
 
-    log.info(f"Bot started. Balance: ${bankroll:.2f}")
+    log.info(f"Loop started. Balance: ${bankroll:.2f}  Positions loaded: {len(om.held_token_ids)}")
 
     while True:
         cycle_start = time.time()
 
-        # ── 6h hard reset ──────────────────────────────────────────────────────
+        # ── Periodic hard reset ────────────────────────────────────────────────
         if cycle_start - last_reset > TRADED_RESET_HOURS * 3600:
-            log.info(f"[RESET] {TRADED_RESET_HOURS}h reset — cancelling all orders")
+            log.info(f"[RESET] {TRADED_RESET_HOURS}h — cancelling all orders")
             om.cancel_all(client)
             _slug_cache.clear()
             bankroll   = get_usdc_balance(client) if not DRY_RUN else bankroll
             last_reset = cycle_start
-            log.info(f"Reset complete. Balance: ${bankroll:.2f}. {om.summary()}")
 
-        # ── Poll for fills ─────────────────────────────────────────────────────
+        # ── Check for fills ────────────────────────────────────────────────────
         fills = om.refresh_from_api(client)
         for f in fills:
-            tg(
-                f"💰 <b>FILL DETECTED</b>  {f['label']}\n"
-                f"{f['size_matched']:.2f} shares @ {f['limit']:.3f}  = ${f['filled_usdc']:.2f}\n"
-                f"Fair at placement: {f['fair']:.3f}  Edge: {f['edge_at_fill']:+.3f}"
-            )
+            tg(f"💰 <b>FILL</b>  {f['label']}\n"
+               f"{f['size_matched']:.2f}sh @ {f['limit']:.3f} = ${f['filled_usdc']:.2f}\n"
+               f"Fair: {f['fair']:.3f}  Edge: {f['edge_at_fill']:+.3f}")
 
-        # ── Refresh bankroll periodically ──────────────────────────────────────
+        # ── Refresh balance every 5 min ────────────────────────────────────────
         if not DRY_RUN and int(cycle_start) % 300 < POLL_INTERVAL:
             bankroll = get_usdc_balance(client)
 
-        current_fairs: dict[str, float] = {}   # token_id → latest fair (for stale detection)
+        current_fairs: dict[str, float] = {}
         cycle_orders = 0
 
         for asset, cfg in ASSETS.items():
@@ -761,19 +878,20 @@ def run() -> None:
                 log.warning(f"No price for {asset}, skipping")
                 continue
 
-            log.info(f"\n{'─'*26} {asset} ${spot:,.2f} {'─'*26}")
-            vol   = get_live_vol(cfg["binance_symbol"], cfg["vol"])
-            drift = get_live_drift(cfg["binance_symbol"], cfg["drift"])
-
+            log.info(f"\n{'─'*24} {asset} ${spot:,.2f} {'─'*24}")
+            drift   = get_live_drift(cfg["binance_symbol"], cfg["drift"])
             markets = collect_markets(asset, cfg)
-            log.info(f"  {len(markets)} {asset} markets collected")
+            log.info(f"  {len(markets)} {asset} markets")
 
             results = []
             for m in markets:
-                r = process_market(client, om, m, spot, asset, cfg, vol, drift, bankroll)
+                try:
+                    r = process_market(client, om, m, spot, asset, cfg, drift, bankroll)
+                except Exception as e:
+                    log.debug(f"  process_market error: {e}")
+                    r = None
                 if r is not None:
                     results.append(r)
-                    # Record current fair for stale-order detection
                     raw = m.get("clobTokenIds") or []
                     if isinstance(raw, str):
                         try: raw = json.loads(raw)
@@ -786,39 +904,65 @@ def run() -> None:
             new_orders    = sum(1 for r in results if r["traded"])
             cycle_orders += new_orders
 
-            if not results:
-                log.info(f"  [{asset}] No uncertain markets found (vol={vol*100:.0f}% drift={drift*100:.0f}%)")
-                continue
+            if results:
+                log.info(f"  {len(results)} priced · {new_orders} orders")
+                log.info(f"  {'DIR':<5} {'STRIKE':>10}  {'FAIR':>5}  {'MID':>5}  {'GAP':>5}  {'SIDE':>4}  {'LIMIT':>6}  {'EDGE':>6}  {'T':>5}  ACTION")
+                for r in sorted(results, key=lambda x: x["net_edge"], reverse=True)[:20]:
+                    log.info(
+                        f"  {r['direction'].upper():<5} ${r['strike']:>9,.0f}"
+                        f"  {r['fair']:>5.3f}  {r['book_mid']:>5.3f}  {r['gap']:>5.3f}"
+                        f"  {r['side']:>4}  {r['limit']:>6.3f}  {r['net_edge']:>+6.3f}"
+                        f"  {r['T_days']:>4.0f}d  {r['action'] or '-'}{'  ← ORDER' if r['traded'] else ''}"
+                    )
+            else:
+                log.info(f"  [{asset}] No priceable markets (drift={drift*100:.0f}%)")
 
-            log.info(f"  [{asset}] {len(results)} uncertain · {new_orders} orders · vol={vol*100:.0f}% drift={drift*100:.0f}%")
-            log.info(f"  {'DIR':<5} {'STRIKE':>10}  {'FAIR':>5}  {'SIDE':>4}  {'LIMIT':>6}  {'NET_EDGE':>9}  {'MODEL':>5}  {'T':>5}  ACTION")
-            for r in sorted(results, key=lambda x: x["net_edge"], reverse=True)[:20]:
-                flag = "  ← ORDER" if r["traded"] else ""
-                log.info(
-                    f"  {r['direction'].upper():<5} ${r['strike']:>10,.0f}"
-                    f"  {r['fair']:>5.3f}  {r['side']:>4}  {r['limit']:>6.3f}"
-                    f"  {r['net_edge']:>+9.3f}  {r['model']:>5}  {r['T_days']:>4.0f}d"
-                    f"  {r['action'] or '-'}{flag}"
-                )
-
-        # ── Cancel stale orders ────────────────────────────────────────────────
         if current_fairs:
             om.cancel_stale(client, current_fairs)
 
         if cycle_orders == 0:
-            log.info("No orders placed this cycle.")
+            log.info("No orders this cycle.")
 
         pnl.maybe_report(om, bankroll)
 
         elapsed   = time.time() - cycle_start
         sleep_for = max(1.0, POLL_INTERVAL - elapsed)
-        log.info(f"\nCycle {elapsed:.1f}s — next in {sleep_for:.0f}s  |  {om.summary()}\n{'='*72}")
+        log.info(f"Cycle {elapsed:.1f}s — next in {sleep_for:.0f}s  |  {om.summary()}\n{'='*72}")
 
         try:
             time.sleep(sleep_for)
         except KeyboardInterrupt:
+            raise
+
+
+def run() -> None:
+    mode = "DRY RUN" if DRY_RUN else "LIVE TRADING"
+    log.info("=" * 72)
+    log.info(f"Polymarket Ultimate Edge Bot  —  {mode}")
+    log.info(f"edge={EDGE_BUFFER*100:.0f}%  min_edge={MIN_EDGE*100:.1f}%  "
+             f"fee={TAKER_FEE*100:.0f}%  Kelly={KELLY_FRACTION}  max=${MAX_BET_USDC}  "
+             f"model_gap_limit={MAX_MODEL_MARKET_GAP*100:.0f}%")
+    log.info("=" * 72)
+
+    pk     = os.getenv("PK") or os.getenv("POLYMARKET_PRIVATE_KEY", "")
+    wallet = get_wallet_address(pk)
+    if wallet:
+        log.info(f"Wallet: {wallet}")
+
+    restart_delay = 30
+    while True:
+        try:
+            client = build_client()
+            run_loop(client, wallet)
+        except KeyboardInterrupt:
             log.info("Stopped by user.")
-            tg(f"🛑 <b>Bot stopped</b>\n{om.summary()}")
+            tg("🛑 <b>Bot stopped</b> (KeyboardInterrupt)")
+            break
+        except Exception as e:
+            log.error(f"Crash: {e} — restarting in {restart_delay}s…")
+            time.sleep(restart_delay)
+            restart_delay = min(restart_delay * 2, 300)  # cap at 5 min
+        else:
             break
 
 
