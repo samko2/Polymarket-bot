@@ -853,6 +853,224 @@ def process_market(client: ClobClient, om: OrderManager,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# HOURLY MARKET SCANNING  (up/down markets — momentum-based, no strike)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Each entry: slug_name used in Polymarket URLs, Binance base symbol
+HOURLY_ASSETS = {
+    "BTC": {"slug_name": "bitcoin",  "binance": "BTC"},
+    "ETH": {"slug_name": "ethereum", "binance": "ETH"},
+    "SOL": {"slug_name": "solana",   "binance": "SOL"},
+}
+
+
+def _et_now() -> datetime:
+    """Current time in US Eastern (EDT = UTC-4 Mar–Nov, EST = UTC-5 otherwise)."""
+    utc = datetime.now(timezone.utc)
+    offset = -4 if 3 <= utc.month <= 10 else -5
+    return utc + timedelta(hours=offset)
+
+
+def generate_hourly_slugs() -> list:
+    """
+    Return list of (slug, asset, binance_sym) for the current hour + next 2 hours in ET.
+    Tries both slug formats Polymarket has used historically.
+    """
+    et     = _et_now()
+    months = ["january","february","march","april","may","june",
+              "july","august","september","october","november","december"]
+    results = []
+
+    for hour_offset in range(3):
+        ts    = et + timedelta(hours=hour_offset)
+        month = months[ts.month - 1]
+        day   = ts.day
+        year  = ts.year
+        h24   = ts.hour
+        ampm  = "am" if h24 < 12 else "pm"
+        h12   = h24 % 12 or 12   # 0→12, 13→1, etc.
+
+        for asset, cfg in HOURLY_ASSETS.items():
+            name    = cfg["slug_name"]
+            bsym    = cfg["binance"]
+            # Format 1: "bitcoin-up-or-down-june-7-2026-2pm-et"
+            slug1 = f"{name}-up-or-down-{month}-{day}-{year}-{h12}{ampm}-et"
+            # Format 2: "bitcoin-up-or-down-june-7-2026-2-pm-et"
+            slug2 = f"{name}-up-or-down-{month}-{day}-{year}-{h12}-{ampm}-et"
+            results.append((slug1, asset, bsym))
+            results.append((slug2, asset, bsym))
+
+    return results
+
+
+# ── Momentum / imbalance signals ─────────────────────────────────────────────
+
+_mom_cache: dict[str, tuple[float, float]] = {}   # bsym → (ts, signal)
+_MOM_TTL = 60.0  # seconds between momentum re-fetches
+
+
+def _hourly_momentum(binance_sym: str) -> float:
+    """
+    Return momentum signal in [-0.15, +0.15] from 1-min Binance klines.
+    Positive = bullish (favour UP token).
+    """
+    now = time.time()
+    if binance_sym in _mom_cache:
+        ts, val = _mom_cache[binance_sym]
+        if now - ts < _MOM_TTL:
+            return val
+
+    try:
+        klines = retry_get(
+            "https://api.binance.com/api/v3/klines",
+            params={"symbol": binance_sym + "USDT", "interval": "1m", "limit": 30},
+            timeout=10,
+        ).json()
+        closes = [float(k[4]) for k in klines]
+        if len(closes) < 12:
+            return 0.0
+        # Multi-timeframe momentum, normalised
+        m10 = (closes[-1] - closes[-11]) / closes[-11]   # 10-bar
+        m5  = (closes[-1] - closes[-6])  / closes[-6]    # 5-bar
+        m2  = (closes[-1] - closes[-3])  / closes[-3]    # 2-bar
+        raw = 0.50 * m10 + 0.30 * m5 + 0.20 * m2
+        val = max(-0.15, min(0.15, raw * 8))             # scale ×8 then clamp
+    except Exception as e:
+        log.debug(f"  Momentum error {binance_sym}: {e}")
+        val = 0.0
+
+    _mom_cache[binance_sym] = (now, val)
+    return val
+
+
+def _book_imbalance(binance_sym: str) -> float:
+    """
+    Return Binance top-10 order-book imbalance in [-1, +1].
+    Positive = more bid depth (bullish).
+    """
+    try:
+        book    = retry_get(
+            "https://api.binance.com/api/v3/depth",
+            params={"symbol": binance_sym + "USDT", "limit": 20},
+            timeout=8,
+        ).json()
+        bid_vol = sum(float(b[1]) for b in book.get("bids", [])[:10])
+        ask_vol = sum(float(a[1]) for a in book.get("asks", [])[:10])
+        total   = bid_vol + ask_vol
+        return (bid_vol - ask_vol) / total if total > 0 else 0.0
+    except Exception:
+        return 0.0
+
+
+def compute_hourly_fair(binance_sym: str) -> tuple:
+    """
+    Return (fair_up, fair_down) for an hourly up/down market.
+    Momentum is the primary signal; order-book imbalance is secondary.
+    Clamped to [0.30, 0.70] — never extreme on a sub-hour bet.
+    """
+    mom      = _hourly_momentum(binance_sym)
+    imb      = _book_imbalance(binance_sym)
+    fair_up  = 0.50 + 2.0 * mom + 0.08 * imb
+    fair_up  = round(max(0.30, min(0.70, fair_up)), 4)
+    return fair_up, round(1 - fair_up, 4)
+
+
+def is_hourly_updown(question: str) -> bool:
+    """Return True if this is a time-of-day up/down question with no price target."""
+    ql = question.lower()
+    if "up or down" not in ql and "higher or lower" not in ql:
+        return False
+    if re.search(r"\$\s*[\d,]+", ql):        # has a price target → not hourly
+        return False
+    if not re.search(r"\b\d{1,2}\s*(am|pm)\b", ql, re.I):  # needs a time
+        return False
+    return True
+
+
+def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -> int:
+    """
+    Scan current + next-2-hour up/down markets for BTC, ETH, SOL.
+    Returns number of orders placed.
+    """
+    orders_placed = 0
+    seen_tokens: set = set()
+
+    for slug, asset, binance_sym in generate_hourly_slugs():
+        try:
+            markets = get_markets_for_slug(slug)
+        except Exception:
+            continue
+
+        for m in markets:
+            question = m.get("question", "")
+            if not is_hourly_updown(question):
+                continue
+            if float(m.get("volume") or 0) < MIN_VOLUME / 5:   # lower bar for hourly
+                continue
+
+            raw = m.get("clobTokenIds") or []
+            if isinstance(raw, str):
+                try: raw = json.loads(raw)
+                except: continue
+            if len(raw) < 2:
+                continue
+
+            token_up, token_down = raw[0], raw[1]
+            if token_up in seen_tokens or token_down in seen_tokens:
+                continue
+            seen_tokens.add(token_up); seen_tokens.add(token_down)
+
+            if om.already_holds(token_up) or om.already_holds(token_down):
+                continue
+            if len(om.held_token_ids) >= MAX_POSITION_TOKENS:
+                continue
+
+            fair_up, fair_down = compute_hourly_fair(binance_sym)
+            # Extract the time portion from the question for readable label
+            tm = re.search(r"\d{1,2}\s*(am|pm)", question, re.I)
+            time_str = tm.group(0) if tm else "?"
+            log.info(f"  ⏰ {asset} hourly [{time_str} ET] "
+                     f"fair_up={fair_up:.3f} fair_dn={fair_down:.3f}  {question[:50]}")
+
+            available = free_bankroll(bankroll, om)
+
+            if fair_up >= 0.50:
+                bid, ask, book_mid, liquid = get_order_book(token_up)
+                if not liquid:
+                    continue
+                if abs(fair_up - book_mid) > MAX_MODEL_MARKET_GAP:
+                    log.debug(f"    Skip hourly UP: model={fair_up:.2f} book={book_mid:.2f}")
+                    continue
+                limit    = round(max(bid + 0.01, fair_up - EDGE_BUFFER, 0.02), 2)
+                limit    = min(limit, ask - 0.01)
+                net_edge = fair_up * (1 - TAKER_FEE) - limit
+                label    = f"{asset} UP {time_str} ET (hourly)"
+                if net_edge >= MIN_EDGE and not om.has_open_order(token_up):
+                    size = kelly_buy(fair_up, limit, available)
+                    if size >= MIN_BET_USDC:
+                        if place_order(client, om, token_up, limit, size, fair_up, label):
+                            orders_placed += 1
+            else:
+                bid_dn, ask_dn, book_mid_dn, liquid_dn = get_order_book(token_down)
+                if not liquid_dn:
+                    continue
+                if abs(fair_down - book_mid_dn) > MAX_MODEL_MARKET_GAP:
+                    log.debug(f"    Skip hourly DOWN: model={fair_down:.2f} book={book_mid_dn:.2f}")
+                    continue
+                limit    = round(max(bid_dn + 0.01, fair_down - EDGE_BUFFER, 0.02), 2)
+                limit    = min(limit, ask_dn - 0.01)
+                net_edge = fair_down * (1 - TAKER_FEE) - limit
+                label    = f"{asset} DOWN {time_str} ET (hourly)"
+                if net_edge >= MIN_EDGE and not om.has_open_order(token_down):
+                    size = kelly_buy(fair_down, limit, available)
+                    if size >= MIN_BET_USDC:
+                        if place_order(client, om, token_down, limit, size, fair_down, label):
+                            orders_placed += 1
+
+    return orders_placed
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # P&L TRACKER
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -959,6 +1177,16 @@ def run_loop(client: ClobClient, wallet: str) -> None:
                     )
             else:
                 log.info(f"  [{asset}] No priceable markets (drift={drift*100:.0f}%)")
+
+        # ── Hourly up/down markets (momentum-based, no strike) ────────────────
+        log.info(f"\n{'─'*24} HOURLY MARKETS {'─'*24}")
+        try:
+            hourly_placed = scan_hourly_markets(client, om, bankroll)
+            cycle_orders += hourly_placed
+            if hourly_placed == 0:
+                log.info("  No hourly edge this cycle.")
+        except Exception as e:
+            log.debug(f"  Hourly scan error: {e}")
 
         if current_fairs:
             om.cancel_stale(client, current_fairs)
