@@ -2,4 +2,4 @@
 builder = "nixpacks"
 
 [deploy]
-startCommand = "python3 polymarket_btc_bot.py & python3 polymarket_btc_hourly_bot.py"
+startCommand = "python3 polymarket_btc_bot.py"
