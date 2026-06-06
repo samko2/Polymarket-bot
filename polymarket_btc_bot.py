@@ -72,6 +72,7 @@ PNL_REPORT_HOURS      = 24
 MAX_MODEL_MARKET_GAP  = 0.30    # skip if model and book-mid disagree >30%
 MIN_BOOK_LIQUIDITY    = 0.01    # skip markets with spread wider than 99 cents
 MAX_POSITION_TOKENS   = 50      # max distinct token positions held at once
+MANUAL_BANKROLL       = float(os.getenv("MANUAL_BANKROLL", "0"))  # override balance check if set
 
 # ── Telegram ───────────────────────────────────────────────────────────────────
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
@@ -877,7 +878,11 @@ def run_loop(client: ClobClient, wallet: str) -> None:
     om  = OrderManager(get_existing_positions(wallet))
     pnl = PnL()
 
-    bankroll   = get_usdc_balance(client, wallet) if not DRY_RUN else MAX_BET_USDC * 20
+    if MANUAL_BANKROLL > 0:
+        bankroll = MANUAL_BANKROLL
+        log.info(f"  Using manual bankroll: ${bankroll:.2f}")
+    else:
+        bankroll = get_usdc_balance(client, wallet) if not DRY_RUN else MAX_BET_USDC * 20
     last_reset = time.time()
 
     log.info(f"Loop started. Balance: ${bankroll:.2f}  Positions loaded: {len(om.held_token_ids)}")
@@ -901,7 +906,7 @@ def run_loop(client: ClobClient, wallet: str) -> None:
                f"Fair: {f['fair']:.3f}  Edge: {f['edge_at_fill']:+.3f}")
 
         # ── Refresh balance every 5 min ────────────────────────────────────────
-        if not DRY_RUN and int(cycle_start) % 300 < POLL_INTERVAL:
+        if not DRY_RUN and MANUAL_BANKROLL == 0 and int(cycle_start) % 300 < POLL_INTERVAL:
             bankroll = get_usdc_balance(client, wallet)
 
         current_fairs: dict[str, float] = {}
