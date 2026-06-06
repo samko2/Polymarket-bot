@@ -343,21 +343,56 @@ class OrderManager:
 _balance_cache: list = [0.0, 0.0]
 
 
-def get_usdc_balance(client: ClobClient) -> float:
+def get_usdc_balance_onchain(wallet: str) -> float:
+    """Fallback: read raw USDC balance directly from Polygon chain."""
+    if not wallet:
+        return 0.0
+    for usdc in [
+        "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",  # native USDC
+        "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",  # USDC.e (bridged)
+    ]:
+        try:
+            data    = "0x70a08231" + wallet[2:].lower().zfill(64)
+            payload = {"jsonrpc":"2.0","method":"eth_call",
+                       "params":[{"to": usdc, "data": data}, "latest"],"id":1}
+            result  = requests.post("https://polygon-rpc.com",
+                                    json=payload, timeout=10).json().get("result","0x0")
+            bal     = round(int(result, 16) / 1e6, 2)
+            if bal > 0:
+                log.info(f"  On-chain USDC ({usdc[:10]}…): ${bal:.2f}")
+                return bal
+        except Exception:
+            pass
+    return 0.0
+
+
+def get_usdc_balance(client: ClobClient, wallet: str = "") -> float:
     now = time.time()
     if _balance_cache[1] and now - _balance_cache[1] < 300:
         return _balance_cache[0]
     try:
-        resp    = client.get_balance_allowance(
+        resp = client.get_balance_allowance(
             BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
         )
-        balance = float(resp.get("balance") or resp.get("available") or 0)
+        log.info(f"  CLOB balance raw: {resp}")
+        balance = float(
+            resp.get("balance") or resp.get("available") or
+            resp.get("allowance") or resp.get("amount") or 0
+        )
+        if balance == 0 and wallet:
+            balance = get_usdc_balance_onchain(wallet)
         _balance_cache[0] = balance
         _balance_cache[1] = now
         log.info(f"  USDC balance: ${balance:.2f}")
         return balance
     except Exception as e:
-        log.debug(f"Balance fetch failed: {e}")
+        log.warning(f"Balance fetch failed: {e}")
+        if wallet:
+            balance = get_usdc_balance_onchain(wallet)
+            if balance > 0:
+                _balance_cache[0] = balance
+                _balance_cache[1] = now
+                return balance
         return _balance_cache[0] or MAX_BET_USDC * 10
 
 
@@ -842,7 +877,7 @@ def run_loop(client: ClobClient, wallet: str) -> None:
     om  = OrderManager(get_existing_positions(wallet))
     pnl = PnL()
 
-    bankroll   = get_usdc_balance(client) if not DRY_RUN else MAX_BET_USDC * 20
+    bankroll   = get_usdc_balance(client, wallet) if not DRY_RUN else MAX_BET_USDC * 20
     last_reset = time.time()
 
     log.info(f"Loop started. Balance: ${bankroll:.2f}  Positions loaded: {len(om.held_token_ids)}")
@@ -855,7 +890,7 @@ def run_loop(client: ClobClient, wallet: str) -> None:
             log.info(f"[RESET] {TRADED_RESET_HOURS}h — cancelling all orders")
             om.cancel_all(client)
             _slug_cache.clear()
-            bankroll   = get_usdc_balance(client) if not DRY_RUN else bankroll
+            bankroll   = get_usdc_balance(client, wallet) if not DRY_RUN else bankroll
             last_reset = cycle_start
 
         # ── Check for fills ────────────────────────────────────────────────────
@@ -867,7 +902,7 @@ def run_loop(client: ClobClient, wallet: str) -> None:
 
         # ── Refresh balance every 5 min ────────────────────────────────────────
         if not DRY_RUN and int(cycle_start) % 300 < POLL_INTERVAL:
-            bankroll = get_usdc_balance(client)
+            bankroll = get_usdc_balance(client, wallet)
 
         current_fairs: dict[str, float] = {}
         cycle_orders = 0
