@@ -57,7 +57,7 @@ CHAIN_ID   = 137
 TICK_SIZE  = "0.01"
 
 # ── Bot config ─────────────────────────────────────────────────────────────────
-DRY_RUN               = True    # ← flip to False for live trading
+DRY_RUN               = False   # LIVE TRADING
 POLL_INTERVAL         = 20      # seconds between scans
 EDGE_BUFFER           = 0.03    # place limit this far below fair (3%)
 MIN_EDGE              = 0.02    # minimum net edge after fee
