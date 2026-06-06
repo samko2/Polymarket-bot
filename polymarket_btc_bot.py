@@ -58,7 +58,7 @@ TICK_SIZE  = "0.01"
 # ── Bot config ─────────────────────────────────────────────────────────────────
 DRY_RUN             = True    # ← flip to False for live trading
 POLL_INTERVAL       = 20      # seconds between scans
-EDGE_BUFFER         = 0.05    # how far below fair we place our limit (5%)
+EDGE_BUFFER         = 0.03    # how far below fair we place our limit (3%)
 MIN_EDGE            = 0.02    # minimum net edge after fee to bother placing
 TAKER_FEE           = 0.02    # Polymarket taker fee on winnings
 KELLY_FRACTION      = 0.25    # quarter-Kelly
@@ -584,7 +584,6 @@ def place_order(client: ClobClient, om: OrderManager,
     log.info(f"{prefix}BUY LIMIT  {label}  {shares} shares @ {limit:.3f}  (${size_usdc:.2f})")
 
     if DRY_RUN:
-        tg(f"🔵 <b>DRY RUN</b>  {label}\nBUY {shares} shares @ {limit:.3f}  (${size_usdc:.2f})\nFair: {fair:.3f}  Edge: {fair*(1-TAKER_FEE)-limit:+.3f}")
         return True
 
     try:
@@ -597,16 +596,14 @@ def place_order(client: ClobClient, om: OrderManager,
         if resp and resp.get("success"):
             order_id = resp.get("orderID", "")
             log.info(f"  ✓ Order placed: {order_id}")
-            tg(f"✅ <b>ORDER PLACED</b>  {label}\nBUY {shares} sh @ {limit:.3f}  (${size_usdc:.2f})\nFair: {fair:.3f}  Edge: {fair*(1-TAKER_FEE)-limit:+.3f}\nID: {order_id}")
+            tg(f"✅ <b>TRADE PLACED</b>  {label}\nBUY {shares} sh @ {limit:.3f}  (${size_usdc:.2f})\nFair: {fair:.3f}  Edge: {fair*(1-TAKER_FEE)-limit:+.3f}\nID: {order_id}")
             if order_id:
                 om.record(order_id, token_id, label, limit, size_usdc, fair)
             return True
         else:
             log.error(f"  ✗ Rejected: {resp}")
-            tg(f"❌ <b>REJECTED</b>  {label}\n{resp}")
     except Exception as e:
         log.error(f"  ✗ Failed: {e}")
-        tg(f"❌ <b>FAILED</b>  {label}\n{e}")
     return False
 
 
@@ -706,7 +703,6 @@ class PnL:
             f"(Check Polymarket dashboard for full P&L)"
         )
         log.info(msg.replace("<b>", "").replace("</b>", ""))
-        tg(msg)
         self.last_report = time.time()
 
 
@@ -729,7 +725,7 @@ def run() -> None:
     bankroll   = get_usdc_balance(client) if not DRY_RUN else MAX_BET_USDC * 20
     last_reset = time.time()
 
-    tg(f"🤖 <b>Bot Started</b>  {mode}\nAssets: BTC · ETH · SOL\nBalance: ${bankroll:.2f}\nEdge buffer: {EDGE_BUFFER*100:.0f}%  Max bet: ${MAX_BET_USDC}")
+    log.info(f"Bot started. Balance: ${bankroll:.2f}")
 
     while True:
         cycle_start = time.time()
@@ -741,7 +737,7 @@ def run() -> None:
             _slug_cache.clear()
             bankroll   = get_usdc_balance(client) if not DRY_RUN else bankroll
             last_reset = cycle_start
-            tg(f"🔄 {TRADED_RESET_HOURS}h reset. Balance: ${bankroll:.2f}. {om.summary()}")
+            log.info(f"Reset complete. Balance: ${bankroll:.2f}. {om.summary()}")
 
         # ── Poll for fills ─────────────────────────────────────────────────────
         fills = om.refresh_from_api(client)
