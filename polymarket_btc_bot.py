@@ -385,11 +385,11 @@ def _fetch_realized_vol(symbol: str, interval: str, bars: int) -> float:
 def get_live_vol(symbol: str, fallback: float, T_years: float = 1.0) -> float:
     """Returns realized vol matched to the market's time horizon."""
     if T_years < 14 / 365:
-        window, interval, label = 7,  "1h", "7d-hourly"
+        window, interval, label = 168, "1h", "7d-hourly"  # 7d × 24h bars
     elif T_years < 60 / 365:
-        window, interval, label = 14, "1d", "14d-daily"
+        window, interval, label = 14,  "1d", "14d-daily"
     else:
-        window, interval, label = 30, "1d", "30d-daily"
+        window, interval, label = 30,  "1d", "30d-daily"
 
     cache_key = f"{symbol}_{window}{interval}"
     now       = time.time()
