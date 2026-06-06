@@ -599,7 +599,7 @@ def is_touch_market(q: str) -> bool:
         r"\bon\s+(january|february|march|april|may|june|july|august"
         r"|september|october|november|december)\s+\d", ql))
     eod   = any(kw in ql for kw in ["end of day","end of week","end of month","end of hour","at end"])
-    touch = any(kw in ql for kw in ["before","by december","by end","by 2027","dip to","reach $","hit $"])
+    touch = any(kw in ql for kw in ["before","by december","by end","by 2026","by 2027","by 2028","dip to","reach $","hit $"])
     return touch and not on_date and not eod
 
 
@@ -895,7 +895,10 @@ def run_loop(client: ClobClient, wallet: str) -> None:
             log.info(f"[RESET] {TRADED_RESET_HOURS}h — cancelling all orders")
             om.cancel_all(client)
             _slug_cache.clear()
-            bankroll   = get_usdc_balance(client, wallet) if not DRY_RUN else bankroll
+            if MANUAL_BANKROLL > 0:
+                bankroll = MANUAL_BANKROLL
+            elif not DRY_RUN:
+                bankroll = get_usdc_balance(client, wallet)
             last_reset = cycle_start
 
         # ── Check for fills ────────────────────────────────────────────────────
