@@ -38,14 +38,15 @@ from py_clob_client_v2 import (
 
 load_dotenv(dotenv_path=os.path.expanduser("~/Desktop/poly/.env"))
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(os.path.expanduser("~/Desktop/poly/bot.log")),
-    ],
-)
+_handlers = [logging.StreamHandler()]
+try:
+    _handlers.append(logging.FileHandler(os.path.expanduser("~/Desktop/poly/bot.log")))
+except OSError:
+    pass  # Railway: ~/Desktop/poly doesn't exist, stdout only is fine
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(message)s",
+                    handlers=_handlers)
 log = logging.getLogger("poly_bot")
 
 # ── Exchange ───────────────────────────────────────────────────────────────────
