@@ -60,11 +60,11 @@ TICK_SIZE  = "0.01"
 DRY_RUN               = False   # LIVE TRADING
 POLL_INTERVAL         = 20      # seconds between scans
 EDGE_BUFFER           = 0.03    # place limit this far below fair (3%)
-MIN_EDGE              = 0.02    # minimum net edge after fee
+MIN_EDGE              = 0.005   # minimum net edge after fee (≥0.5% — 2% blocked all trades)
 TAKER_FEE             = 0.02    # Polymarket taker fee on winnings
 KELLY_FRACTION        = 0.25    # quarter-Kelly
 MAX_BET_USDC          = 1.0     # hard cap per order
-MIN_BET_USDC          = 0.50    # skip orders below this
+MIN_BET_USDC          = 0.20    # skip orders below this ($0.50 blocked all kelly bets on $30 bankroll)
 MIN_VOLUME            = 5_000   # min market lifetime volume
 TRADED_RESET_HOURS    = 6       # full reset every N hours
 STALE_FAIR_DRIFT      = 0.12    # cancel order if fair drifted >12%
@@ -495,9 +495,10 @@ def get_price(cg_id: str, sym: str) -> float | None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def generate_daily_slugs(names: list) -> list:
-    slugs, now = [], datetime.now(timezone.utc)
+    # Polymarket names daily markets by ET date — use ET, not UTC
+    slugs, et = [], _et_now()
     for i in range(5):
-        d    = now + timedelta(days=i)
+        d    = et + timedelta(days=i)
         date = f"{d.strftime('%B').lower()}-{d.day}-{d.year}"
         for n in names:
             slugs += [f"{n}-above-on-{date}", f"{n}-up-or-down-on-{date}"]
@@ -724,8 +725,8 @@ def build_client() -> ClobClient:
 def place_order(client: ClobClient, om: OrderManager,
                 token_id: str, limit: float, size_usdc: float,
                 fair: float, label: str) -> bool:
-    shares = round(size_usdc / limit, 2)
-    if shares < 1:
+    shares = round(size_usdc / limit, 4)  # Polymarket supports fractional shares
+    if shares < 0.01:                     # only block dust — not valid fractional orders
         return False
 
     log.info(f"{'[DRY] ' if DRY_RUN else ''}BUY LIMIT  {label}  {shares}sh @ {limit:.3f}  (${size_usdc:.2f})")
@@ -793,23 +794,37 @@ def process_market(client: ClobClient, om: OrderManager,
     if not sigs:
         return None
 
-    sig = sigs[0]
-    direction, strike, T = sig["direction"], sig["strike"], sig["T"]
-
-    if not (0.15 * spot < strike < 6.0 * spot):
-        return None
-
-    # ── Vol matched to time horizon ────────────────────────────────────────────
+    T = sigs[0]["T"]
     vol = get_live_vol(cfg["binance_symbol"], cfg["vol"], T)
 
     # ── Price model ───────────────────────────────────────────────────────────
-    touch = is_touch_market(question)
-    fair  = (hit_probability if touch else european_prob)(spot, strike, T, vol, drift, direction)
-    if fair is None or not (0.10 < fair < 0.90):
-        return None
-
-    model = "touch" if touch else "euro"
-    label = f"{asset} {direction.upper()} ${strike:,.0f} ({model}) T={T*365:.0f}d"
+    if len(sigs) == 2:
+        # "Between $lo and $hi" market — price as P(lo < S_T < hi)
+        lo_sig = next((s for s in sigs if s["direction"] == "down"), sigs[1])
+        hi_sig = next((s for s in sigs if s["direction"] == "up"),   sigs[0])
+        lo, hi = lo_sig["strike"], hi_sig["strike"]
+        if not (0.15 * spot < lo < hi < 6.0 * spot):
+            return None
+        p_above_lo = european_prob(spot, lo, T, vol, drift, "up")
+        p_above_hi = european_prob(spot, hi, T, vol, drift, "up")
+        if p_above_lo is None or p_above_hi is None:
+            return None
+        fair      = round(max(0.03, min(0.97, p_above_lo - p_above_hi)), 4)
+        direction = "up"
+        strike    = (lo + hi) / 2  # midpoint for display
+        model     = "between"
+        label     = f"{asset} BETWEEN ${lo:,.0f}–${hi:,.0f} T={T*365:.0f}d"
+    else:
+        sig       = sigs[0]
+        direction, strike = sig["direction"], sig["strike"]
+        if not (0.15 * spot < strike < 6.0 * spot):
+            return None
+        touch = is_touch_market(question)
+        fair  = (hit_probability if touch else european_prob)(spot, strike, T, vol, drift, direction)
+        if fair is None or not (0.10 < fair < 0.90):
+            return None
+        model = "touch" if touch else "euro"
+        label = f"{asset} {direction.upper()} ${strike:,.0f} ({model}) T={T*365:.0f}d"
 
     # ── Order book cross-check ─────────────────────────────────────────────────
     bid, ask, book_mid, liquid = get_order_book(token_yes)
