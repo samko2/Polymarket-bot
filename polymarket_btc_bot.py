@@ -717,21 +717,39 @@ def build_client() -> ClobClient:
                  f"  CLOB_PASS_PHRASE={creds.api_passphrase}")
     client = ClobClient(host=CLOB_HOST, chain_id=CHAIN_ID, key=pk, creds=creds)
 
+    # ── Diagnostics: log what address the CLOB sees us as ─────────────────────
+    try:
+        addr = client.get_address()
+        log.info(f"  CLOB maker address: {addr}")
+    except Exception as e:
+        log.info(f"  get_address(): {e}")
+
+    try:
+        ok = client.get_ok()
+        log.info(f"  CLOB ok: {ok}")
+    except Exception as e:
+        log.info(f"  get_ok(): {e}")
+
+    # ── Allowance check ────────────────────────────────────────────────────────
+    try:
+        al = client.get_address_allowances()
+        log.info(f"  Allowances: {al}")
+    except Exception as e:
+        log.info(f"  get_address_allowances(): {e}")
+
     # ── One-time proxy wallet activation ──────────────────────────────────────
-    # Polymarket requires the wallet to be registered as an allowed maker on the
-    # CLOB before any orders can be placed. This is a no-op if already set up.
     try:
         resp = client.update_agent_auth()
-        log.info(f"  Proxy wallet auth: {resp}")
+        log.info(f"  update_agent_auth: {resp}")
     except AttributeError:
-        # Older library version — try set_allowances instead
+        log.info("  update_agent_auth not available in this library version")
         try:
             client.set_allowances()
-            log.info("  Allowances set via set_allowances()")
+            log.info("  set_allowances: OK")
         except Exception as e:
-            log.debug(f"  set_allowances: {e}")
+            log.info(f"  set_allowances: {e}")
     except Exception as e:
-        log.warning(f"  Proxy wallet setup: {e} (may already be active)")
+        log.info(f"  update_agent_auth: {e}")
 
     return client
 
