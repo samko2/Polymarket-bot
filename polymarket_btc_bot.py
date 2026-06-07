@@ -804,15 +804,15 @@ def process_market(client: ClobClient, om: OrderManager,
     if not liquid:
         return None  # dead market, no counterparty
 
-    book_fair = book_mid if fair >= 0.50 else 1 - book_mid
-    gap       = abs(fair - book_fair)
+    # Always compare YES vs YES — gap is the same whether measured from YES or NO side
+    gap = abs(fair - book_mid)
     if gap > MAX_MODEL_MARKET_GAP:
         # Model and market strongly disagree — likely bad question parse, skip
-        log.debug(f"  Skip {label[:40]}: model={fair:.2f} book={book_fair:.2f} gap={gap:.2f}")
+        log.debug(f"  Skip {label[:40]}: model={fair:.2f} book_mid={book_mid:.2f} gap={gap:.2f}")
         return None
 
     result = dict(question=question[:65], direction=direction, strike=strike,
-                  fair=fair, book_mid=book_mid, gap=gap, volume=volume,
+                  fair=fair, book_mid=book_mid, gap=round(gap, 3), volume=volume,
                   T_days=T*365, model=model, action=None, traded=False,
                   limit=0.0, net_edge=0.0, side="?")
 
@@ -975,6 +975,10 @@ def compute_hourly_fair(binance_sym: str) -> tuple:
     return fair_up, round(1 - fair_up, 4)
 
 
+MIN_HOURLY_VOLUME  = 200    # much lower bar than weekly/monthly markets
+MIN_HOURLY_MINS    = 20    # skip hourly markets with <20 min to expiry
+
+
 def is_hourly_updown(question: str) -> bool:
     """Return True if this is a time-of-day up/down question with no price target."""
     ql = question.lower()
@@ -982,9 +986,63 @@ def is_hourly_updown(question: str) -> bool:
         return False
     if re.search(r"\$\s*[\d,]+", ql):        # has a price target → not hourly
         return False
-    if not re.search(r"\b\d{1,2}\s*(am|pm)\b", ql, re.I):  # needs a time
+    # Flexible time pattern: "2pm", "2 pm", "2:00 pm", "14:00"
+    if not re.search(r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b|\b\d{2}:\d{2}\b", ql, re.I):
         return False
     return True
+
+
+def _hourly_mins_remaining(market: dict) -> float:
+    """Return minutes until this market's end date, or 999 if unknown."""
+    for key in ("endDateIso", "end_date_iso", "endDate", "end_date", "closeTime"):
+        val = market.get(key)
+        if val:
+            try:
+                end = datetime.fromisoformat(str(val).replace("Z", "+00:00"))
+                return (end - datetime.now(timezone.utc)).total_seconds() / 60
+            except Exception:
+                pass
+    return 999.0
+
+
+def _collect_hourly_markets() -> list[tuple[dict, str, str]]:
+    """
+    Return list of (market, asset, binance_sym) for all hourly up/down markets.
+    Tries slug lookup first, then Gamma API keyword search as fallback.
+    """
+    seen, results = set(), []
+
+    def add(m: dict, asset: str, bsym: str) -> None:
+        raw = m.get("clobTokenIds") or []
+        if isinstance(raw, str):
+            try: raw = json.loads(raw)
+            except: return
+        tid = raw[0] if raw else m.get("id", "")
+        if tid and tid not in seen and is_hourly_updown(m.get("question", "")):
+            seen.add(tid)
+            results.append((m, asset, bsym))
+
+    # ── Slug-based lookup ──────────────────────────────────────────────────
+    for slug, asset, bsym in generate_hourly_slugs():
+        try:
+            for m in get_markets_for_slug(slug):
+                add(m, asset, bsym)
+        except Exception:
+            pass
+
+    # ── Gamma keyword fallback ─────────────────────────────────────────────
+    if not results:
+        kw_map = [("bitcoin up or down", "BTC", "BTC"),
+                  ("ethereum up or down", "ETH", "ETH"),
+                  ("solana up or down",   "SOL", "SOL")]
+        for kw, asset, bsym in kw_map:
+            try:
+                for m in search_gamma(kw, limit=20):
+                    add(m, asset, bsym)
+            except Exception:
+                pass
+
+    return results
 
 
 def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -> int:
@@ -995,77 +1053,76 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -
     orders_placed = 0
     seen_tokens: set = set()
 
-    for slug, asset, binance_sym in generate_hourly_slugs():
-        try:
-            markets = get_markets_for_slug(slug)
-        except Exception:
+    for m, asset, binance_sym in _collect_hourly_markets():
+        question = m.get("question", "")
+
+        # ── Volume gate (lower than weekly markets) ────────────────────────
+        if float(m.get("volume") or 0) < MIN_HOURLY_VOLUME:
             continue
 
-        for m in markets:
-            question = m.get("question", "")
-            if not is_hourly_updown(question):
-                continue
-            if float(m.get("volume") or 0) < MIN_VOLUME / 5:   # lower bar for hourly
-                continue
+        # ── Skip markets about to expire (< 20 min left) ──────────────────
+        mins_left = _hourly_mins_remaining(m)
+        if mins_left < MIN_HOURLY_MINS:
+            log.debug(f"    Skip expiring hourly ({mins_left:.0f}m left): {question[:40]}")
+            continue
 
-            raw = m.get("clobTokenIds") or []
-            if isinstance(raw, str):
-                try: raw = json.loads(raw)
-                except: continue
-            if len(raw) < 2:
+        raw = m.get("clobTokenIds") or []
+        if isinstance(raw, str):
+            try: raw = json.loads(raw)
+            except: continue
+        if len(raw) < 2:
+            continue
+
+        token_up, token_down = raw[0], raw[1]
+        if token_up in seen_tokens or token_down in seen_tokens:
+            continue
+        seen_tokens.add(token_up); seen_tokens.add(token_down)
+
+        if om.already_holds(token_up) or om.already_holds(token_down):
+            continue
+        if len(om.held_token_ids) >= MAX_POSITION_TOKENS:
+            continue
+
+        fair_up, fair_down = compute_hourly_fair(binance_sym)
+        tm       = re.search(r"\d{1,2}(?::\d{2})?\s*(?:am|pm)", question, re.I)
+        time_str = tm.group(0) if tm else "?"
+        log.info(f"  ⏰ {asset} hourly [{time_str} ET | {mins_left:.0f}m left] "
+                 f"fair_up={fair_up:.3f} fair_dn={fair_down:.3f}  {question[:45]}")
+
+        available = free_bankroll(bankroll, om)
+
+        if fair_up >= 0.50:
+            bid, ask, book_mid, liquid = get_order_book(token_up)
+            if not liquid:
                 continue
-
-            token_up, token_down = raw[0], raw[1]
-            if token_up in seen_tokens or token_down in seen_tokens:
+            if abs(fair_up - book_mid) > MAX_MODEL_MARKET_GAP:
+                log.debug(f"    Skip hourly UP: model={fair_up:.2f} book={book_mid:.2f}")
                 continue
-            seen_tokens.add(token_up); seen_tokens.add(token_down)
-
-            if om.already_holds(token_up) or om.already_holds(token_down):
+            limit    = round(max(bid + 0.01, fair_up - EDGE_BUFFER, 0.02), 2)
+            limit    = min(limit, ask - 0.01)
+            net_edge = fair_up * (1 - TAKER_FEE) - limit
+            label    = f"{asset} UP {time_str} ET (hourly)"
+            if net_edge >= MIN_EDGE and not om.has_open_order(token_up):
+                size = kelly_buy(fair_up, limit, available)
+                if size >= MIN_BET_USDC:
+                    if place_order(client, om, token_up, limit, size, fair_up, label):
+                        orders_placed += 1
+        else:
+            bid_dn, ask_dn, book_mid_dn, liquid_dn = get_order_book(token_down)
+            if not liquid_dn:
                 continue
-            if len(om.held_token_ids) >= MAX_POSITION_TOKENS:
+            if abs(fair_down - book_mid_dn) > MAX_MODEL_MARKET_GAP:
+                log.debug(f"    Skip hourly DOWN: model={fair_down:.2f} book={book_mid_dn:.2f}")
                 continue
-
-            fair_up, fair_down = compute_hourly_fair(binance_sym)
-            # Extract the time portion from the question for readable label
-            tm = re.search(r"\d{1,2}\s*(am|pm)", question, re.I)
-            time_str = tm.group(0) if tm else "?"
-            log.info(f"  ⏰ {asset} hourly [{time_str} ET] "
-                     f"fair_up={fair_up:.3f} fair_dn={fair_down:.3f}  {question[:50]}")
-
-            available = free_bankroll(bankroll, om)
-
-            if fair_up >= 0.50:
-                bid, ask, book_mid, liquid = get_order_book(token_up)
-                if not liquid:
-                    continue
-                if abs(fair_up - book_mid) > MAX_MODEL_MARKET_GAP:
-                    log.debug(f"    Skip hourly UP: model={fair_up:.2f} book={book_mid:.2f}")
-                    continue
-                limit    = round(max(bid + 0.01, fair_up - EDGE_BUFFER, 0.02), 2)
-                limit    = min(limit, ask - 0.01)
-                net_edge = fair_up * (1 - TAKER_FEE) - limit
-                label    = f"{asset} UP {time_str} ET (hourly)"
-                if net_edge >= MIN_EDGE and not om.has_open_order(token_up):
-                    size = kelly_buy(fair_up, limit, available)
-                    if size >= MIN_BET_USDC:
-                        if place_order(client, om, token_up, limit, size, fair_up, label):
-                            orders_placed += 1
-            else:
-                bid_dn, ask_dn, book_mid_dn, liquid_dn = get_order_book(token_down)
-                if not liquid_dn:
-                    continue
-                if abs(fair_down - book_mid_dn) > MAX_MODEL_MARKET_GAP:
-                    log.debug(f"    Skip hourly DOWN: model={fair_down:.2f} book={book_mid_dn:.2f}")
-                    continue
-                limit    = round(max(bid_dn + 0.01, fair_down - EDGE_BUFFER, 0.02), 2)
-                limit    = min(limit, ask_dn - 0.01)
-                net_edge = fair_down * (1 - TAKER_FEE) - limit
-                label    = f"{asset} DOWN {time_str} ET (hourly)"
-                if net_edge >= MIN_EDGE and not om.has_open_order(token_down):
-                    size = kelly_buy(fair_down, limit, available)
-                    if size >= MIN_BET_USDC:
-                        if place_order(client, om, token_down, limit, size, fair_down, label):
-                            orders_placed += 1
+            limit    = round(max(bid_dn + 0.01, fair_down - EDGE_BUFFER, 0.02), 2)
+            limit    = min(limit, ask_dn - 0.01)
+            net_edge = fair_down * (1 - TAKER_FEE) - limit
+            label    = f"{asset} DOWN {time_str} ET (hourly)"
+            if net_edge >= MIN_EDGE and not om.has_open_order(token_down):
+                size = kelly_buy(fair_down, limit, available)
+                if size >= MIN_BET_USDC:
+                    if place_order(client, om, token_down, limit, size, fair_down, label):
+                        orders_placed += 1
 
     return orders_placed
 
