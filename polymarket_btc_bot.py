@@ -703,53 +703,40 @@ def kelly_buy(fair: float, limit: float, bankroll: float) -> float:
 def build_client() -> ClobClient:
     pk = os.getenv("PK") or os.getenv("POLYMARKET_PRIVATE_KEY")
     if not pk: raise EnvironmentError("PK not set in .env")
-    ak, sec, pw = os.getenv("CLOB_API_KEY"), os.getenv("CLOB_SECRET"), os.getenv("CLOB_PASS_PHRASE")
-    if ak and sec and pw:
-        creds = ApiCreds(api_key=ak, api_secret=sec, api_passphrase=pw)
-        log.info("Using saved API credentials")
-    else:
-        log.info("Deriving API credentials from PK…")
-        tmp   = ClobClient(host=CLOB_HOST, chain_id=CHAIN_ID, key=pk)
-        creds = tmp.create_or_derive_api_key()
-        log.info(f"Tip — add these to Railway env vars to skip derivation:\n"
-                 f"  CLOB_API_KEY={creds.api_key}\n"
-                 f"  CLOB_SECRET={creds.api_secret}\n"
-                 f"  CLOB_PASS_PHRASE={creds.api_passphrase}")
+
+    # Always derive fresh credentials from PK — never use saved CLOB_API_KEY/SECRET/PASS_PHRASE
+    # (saved creds may be from a different key and cause "maker address not allowed")
+    log.info("Deriving API credentials from PK…")
+    tmp   = ClobClient(host=CLOB_HOST, chain_id=CHAIN_ID, key=pk)
+    creds = tmp.create_or_derive_api_key()
+
     client = ClobClient(host=CLOB_HOST, chain_id=CHAIN_ID, key=pk, creds=creds)
 
-    # ── Diagnostics: log what address the CLOB sees us as ─────────────────────
-    try:
-        addr = client.get_address()
-        log.info(f"  CLOB maker address: {addr}")
-    except Exception as e:
-        log.info(f"  get_address(): {e}")
+    # ── Startup checks ────────────────────────────────────────────────────────
+    from eth_account import Account as _Acct
+    wallet = _Acct.from_key(pk).address
+    log.info(f"Wallet: {wallet}")
 
     try:
-        ok = client.get_ok()
-        log.info(f"  CLOB ok: {ok}")
+        bal = client.get_balance_allowance(
+            params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        )
+        usdc = float(bal.get("balance", 0)) / 1e6
+        log.info(f"CLOB USDC balance: ${usdc:.2f}")
+        if usdc == 0:
+            log.warning("⚠️  CLOB shows $0 USDC. Complete the deposit wallet flow: "
+                        "polymarket.com → Deposit → From Wallet (Polygon) → deposit USDC "
+                        "from your Phantom wallet. This one-time step registers your address.")
     except Exception as e:
-        log.info(f"  get_ok(): {e}")
+        log.info(f"  balance check: {e}")
 
-    # ── Allowance check ────────────────────────────────────────────────────────
     try:
-        al = client.get_address_allowances()
-        log.info(f"  Allowances: {al}")
-    except Exception as e:
-        log.info(f"  get_address_allowances(): {e}")
-
-    # ── One-time proxy wallet activation ──────────────────────────────────────
-    try:
-        resp = client.update_agent_auth()
-        log.info(f"  update_agent_auth: {resp}")
-    except AttributeError:
-        log.info("  update_agent_auth not available in this library version")
-        try:
-            client.set_allowances()
-            log.info("  set_allowances: OK")
-        except Exception as e:
-            log.info(f"  set_allowances: {e}")
-    except Exception as e:
-        log.info(f"  update_agent_auth: {e}")
+        # Tell CLOB to re-read on-chain balance/allowance
+        client.update_balance_allowance(
+            params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        )
+    except Exception:
+        pass
 
     return client
 
