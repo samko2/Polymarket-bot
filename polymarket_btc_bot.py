@@ -715,7 +715,25 @@ def build_client() -> ClobClient:
                  f"  CLOB_API_KEY={creds.api_key}\n"
                  f"  CLOB_SECRET={creds.api_secret}\n"
                  f"  CLOB_PASS_PHRASE={creds.api_passphrase}")
-    return ClobClient(host=CLOB_HOST, chain_id=CHAIN_ID, key=pk, creds=creds)
+    client = ClobClient(host=CLOB_HOST, chain_id=CHAIN_ID, key=pk, creds=creds)
+
+    # ── One-time proxy wallet activation ──────────────────────────────────────
+    # Polymarket requires the wallet to be registered as an allowed maker on the
+    # CLOB before any orders can be placed. This is a no-op if already set up.
+    try:
+        resp = client.update_agent_auth()
+        log.info(f"  Proxy wallet auth: {resp}")
+    except AttributeError:
+        # Older library version — try set_allowances instead
+        try:
+            client.set_allowances()
+            log.info("  Allowances set via set_allowances()")
+        except Exception as e:
+            log.debug(f"  set_allowances: {e}")
+    except Exception as e:
+        log.warning(f"  Proxy wallet setup: {e} (may already be active)")
+
+    return client
 
 
 # ══════════════════════════════════════════════════════════════════════════════
