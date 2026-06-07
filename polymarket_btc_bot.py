@@ -99,7 +99,7 @@ ASSETS = {
         "drift":          0.20,
         "binance_symbol": "BTC",
         "coingecko_id":   "bitcoin",
-        "keywords":       ["bitcoin", "btc"],
+        "keywords":       ["bitcoin"],   # "btc" results are a subset of "bitcoin"
         "daily_names":    ["bitcoin", "btc"],
         "slugs": [
             "what-price-will-bitcoin-hit-before-2027",
@@ -112,7 +112,7 @@ ASSETS = {
         "drift":          0.15,
         "binance_symbol": "ETH",
         "coingecko_id":   "ethereum",
-        "keywords":       ["ethereum", "eth"],
+        "keywords":       ["ethereum"],  # "eth" results are a subset of "ethereum"
         "daily_names":    ["ethereum", "eth"],
         "slugs": [
             "what-price-will-ethereum-hit-before-2027",
@@ -127,7 +127,7 @@ ASSETS = {
         "drift":          0.25,
         "binance_symbol": "SOL",
         "coingecko_id":   "solana",
-        "keywords":       ["solana", "sol"],
+        "keywords":       ["solana"],    # "sol" results are a subset of "solana"
         "daily_names":    ["solana", "sol"],
         "slugs": [
             "what-price-will-solana-hit-before-2027",
@@ -142,17 +142,22 @@ _slug_cache:  dict = {}
 _vol_cache:   dict = {}
 _drift_cache: dict = {}
 _book_cache:  dict = {}
-SLUG_TTL = 300
-BOOK_TTL = 15    # order books stale quickly
+_imb_cache:   dict = {}   # Binance book-imbalance cache
+SLUG_TTL  = 300
+BOOK_TTL  = 15    # order books stale quickly
+SLUG_MAX  = 2000  # evict oldest entries beyond this to prevent memory growth
+IMB_TTL   = 60    # imbalance re-fetched once per minute
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # HTTP WITH RETRY + EXPONENTIAL BACKOFF
 # ══════════════════════════════════════════════════════════════════════════════
 
+import random as _random
+
 def retry_get(url: str, params: dict = None, timeout: int = 10,
               attempts: int = 3) -> requests.Response:
-    """GET with exponential backoff. Raises on final failure."""
+    """GET with exponential backoff + jitter. Raises on final failure."""
     delay = 2.0
     for i in range(attempts):
         try:
@@ -162,8 +167,9 @@ def retry_get(url: str, params: dict = None, timeout: int = 10,
         except Exception as e:
             if i == attempts - 1:
                 raise
-            log.debug(f"Request failed ({e}), retrying in {delay:.0f}s…")
-            time.sleep(delay)
+            jitter = delay * _random.uniform(0.8, 1.2)   # ±20% jitter
+            log.debug(f"Request failed ({e}), retrying in {jitter:.1f}s…")
+            time.sleep(jitter)
             delay *= 2
 
 
@@ -519,10 +525,16 @@ def get_markets_for_slug(slug: str) -> list:
         resp = retry_get(f"{GAMMA_HOST}/events", params={"slug": slug}, timeout=12)
         data = resp.json()
         ms   = data[0].get("markets", []) if isinstance(data, list) and data else []
+        # Only cache successful (even if genuinely empty) responses — never cache errors
+        if len(_slug_cache) >= SLUG_MAX:
+            # Evict the oldest quarter to keep memory bounded
+            oldest = sorted(_slug_cache, key=lambda k: _slug_cache[k][0])[:SLUG_MAX // 4]
+            for k in oldest:
+                del _slug_cache[k]
         _slug_cache[slug] = (now, ms)
         return ms
     except Exception:
-        _slug_cache[slug] = (now, [])
+        # Don't cache failures — a brief API blip won't poison the next 5 minutes
         return []
 
 
@@ -946,8 +958,11 @@ def _hourly_momentum(binance_sym: str) -> float:
 def _book_imbalance(binance_sym: str) -> float:
     """
     Return Binance top-10 order-book imbalance in [-1, +1].
-    Positive = more bid depth (bullish).
+    Positive = more bid depth (bullish). Cached for IMB_TTL seconds.
     """
+    now = time.time()
+    if binance_sym in _imb_cache and now - _imb_cache[binance_sym][0] < IMB_TTL:
+        return _imb_cache[binance_sym][1]
     try:
         book    = retry_get(
             "https://api.binance.com/api/v3/depth",
@@ -957,9 +972,11 @@ def _book_imbalance(binance_sym: str) -> float:
         bid_vol = sum(float(b[1]) for b in book.get("bids", [])[:10])
         ask_vol = sum(float(a[1]) for a in book.get("asks", [])[:10])
         total   = bid_vol + ask_vol
-        return (bid_vol - ask_vol) / total if total > 0 else 0.0
+        val     = (bid_vol - ask_vol) / total if total > 0 else 0.0
     except Exception:
-        return 0.0
+        val = _imb_cache.get(binance_sym, (0, 0.0))[1]  # reuse last known value
+    _imb_cache[binance_sym] = (now, val)
+    return val
 
 
 def compute_hourly_fair(binance_sym: str) -> tuple:
@@ -1242,6 +1259,16 @@ def run_loop(client: ClobClient, wallet: str) -> None:
             cycle_orders += hourly_placed
             if hourly_placed == 0:
                 log.info("  No hourly edge this cycle.")
+            # Register hourly fairs so stale hourly orders get cancelled too
+            for m, asset, bsym in _collect_hourly_markets():
+                raw = m.get("clobTokenIds") or []
+                if isinstance(raw, str):
+                    try: raw = json.loads(raw)
+                    except: raw = []
+                if len(raw) >= 2:
+                    fu, fd = compute_hourly_fair(bsym)
+                    current_fairs[raw[0]] = fu
+                    current_fairs[raw[1]] = fd
         except Exception as e:
             log.debug(f"  Hourly scan error: {e}")
 
