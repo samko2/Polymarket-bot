@@ -709,20 +709,16 @@ def build_client() -> ClobClient:
     wallet = _Acct.from_key(pk).address
     log.info(f"Wallet: {wallet}")
 
-    log.info("Deriving API credentials from PK…")
-    tmp   = ClobClient(host=CLOB_HOST, chain_id=CHAIN_ID, key=pk)
-    creds = tmp.create_or_derive_api_key()
-
-    # ── Auto-detect the signature type that holds the funds ───────────────────
+    # ── Step 1: detect which signature type holds the funds ──────────────────
     # Polymarket has 4 account types: EOA(0), POLY_PROXY(1), POLY_GNOSIS_SAFE(2), POLY_1271(3)
-    # The deposit wallet flow registers funds under one of these — find which one.
+    # Use a plain EOA client just for balance-scanning (no creds needed for GET).
+    log.info("Scanning signature types to find funded account…")
+    scan_tmp = ClobClient(host=CLOB_HOST, chain_id=CHAIN_ID, key=pk)
     detected_sig_type = None
     for st in [SignatureTypeV2.EOA, SignatureTypeV2.POLY_PROXY,
                SignatureTypeV2.POLY_GNOSIS_SAFE, SignatureTypeV2.POLY_1271]:
         try:
-            probe = ClobClient(host=CLOB_HOST, chain_id=CHAIN_ID, key=pk,
-                               creds=creds, signature_type=int(st))
-            bal = probe.get_balance_allowance(
+            bal = scan_tmp.get_balance_allowance(
                 params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL,
                                               signature_type=int(st))
             )
@@ -738,7 +734,16 @@ def build_client() -> ClobClient:
         log.warning("⚠️  CLOB shows $0 across all signature types. "
                     "Go to polymarket.com → Deposit → From Wallet (Polygon) → "
                     "deposit any USDC amount from Phantom to register this address.")
-        detected_sig_type = None  # fall back to default EOA
+        detected_sig_type = 0  # fall back to EOA
+
+    # ── Step 2: derive API key with the MATCHING signature type ──────────────
+    # The CLOB validates: order.signer must match the address of the API KEY.
+    # API keys are registered per (address, signature_type) — must derive with
+    # the same sig type we'll use when placing orders.
+    log.info(f"Deriving API credentials for signature_type={detected_sig_type}…")
+    tmp   = ClobClient(host=CLOB_HOST, chain_id=CHAIN_ID, key=pk,
+                       signature_type=detected_sig_type)
+    creds = tmp.create_or_derive_api_key()
 
     client = ClobClient(host=CLOB_HOST, chain_id=CHAIN_ID, key=pk, creds=creds,
                         signature_type=detected_sig_type)
