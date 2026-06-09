@@ -386,8 +386,8 @@ def get_usdc_balance(client: ClobClient, wallet: str = "") -> float:
             resp.get("balance") or resp.get("available") or
             resp.get("allowance") or resp.get("amount") or 0
         )
-        # CLOB returns balance in raw token units (6 decimals) — convert to USDC
-        balance = raw / 1e6 if raw > 1000 else raw
+        # CLOB always returns balance in raw token units (6 decimals USDC)
+        balance = raw / 1e6
         if balance == 0 and wallet:
             balance = get_usdc_balance_onchain(wallet)
         _balance_cache[0] = balance
@@ -708,54 +708,35 @@ def _get_proxy_wallet_address(eoa: str) -> str | None:
     The proxy address is needed as 'funder' for POLY_PROXY / POLY_1271 orders.
     """
     # Method 1: Gamma API accounts endpoint
-    try:
-        resp = requests.get(
-            f"{GAMMA_HOST}/accounts",
-            params={"address": eoa},
-            timeout=8,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            log.info(f"  Gamma accounts response: {data}")
-            if isinstance(data, list) and data:
-                item = data[0]
-            elif isinstance(data, dict):
-                item = data
-            else:
-                item = {}
-            for key in ("proxyWallet", "proxy_wallet", "proxy", "maker",
-                        "depositAddress", "deposit_address", "address"):
-                val = item.get(key)
-                if val and val.lower() != eoa.lower():
-                    log.info(f"  Found proxy via Gamma API [{key}]: {val}")
-                    return val
-    except Exception as e:
-        log.info(f"  Gamma accounts lookup failed: {e}")
+    _PROXY_KEYS = ("proxyWallet", "proxy_wallet", "proxy", "maker",
+                   "depositAddress", "deposit_address", "address")
 
-    # Method 2: Data API
-    try:
-        resp2 = requests.get(
-            f"{DATA_HOST}/accounts",
-            params={"address": eoa},
-            timeout=8,
-        )
-        if resp2.status_code == 200:
-            data2 = resp2.json()
-            log.info(f"  Data accounts response: {data2}")
-            if isinstance(data2, list) and data2:
-                item2 = data2[0]
-            elif isinstance(data2, dict):
-                item2 = data2
-            else:
-                item2 = {}
-            for key in ("proxyWallet", "proxy_wallet", "proxy", "maker",
-                        "depositAddress", "deposit_address"):
-                val = item2.get(key)
-                if val and val.lower() != eoa.lower():
-                    log.info(f"  Found proxy via Data API [{key}]: {val}")
-                    return val
-    except Exception as e:
-        log.info(f"  Data accounts lookup failed: {e}")
+    def _extract(data) -> str | None:
+        item = data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else {})
+        for key in _PROXY_KEYS:
+            val = item.get(key)
+            if val and str(val).lower() not in (eoa.lower(), "", "0x0",
+                                                "0x0000000000000000000000000000000000000000"):
+                log.info(f"  Found proxy [{key}]: {val}")
+                return val
+        return None
+
+    for label, url in [("Gamma", f"{GAMMA_HOST}/accounts"),
+                       ("Data",  f"{DATA_HOST}/accounts")]:
+        for attempt in range(3):
+            try:
+                resp = requests.get(url, params={"address": eoa}, timeout=8)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    log.info(f"  {label} accounts response: {data}")
+                    result = _extract(data)
+                    if result:
+                        return result
+                break  # non-200 but reachable → no point retrying
+            except Exception as e:
+                log.info(f"  {label} attempt {attempt+1} failed: {e}")
+                if attempt < 2:
+                    time.sleep(1.5 ** attempt)
 
     return None
 
@@ -858,8 +839,12 @@ def build_client() -> ClobClient:
 def place_order(client: ClobClient, om: OrderManager,
                 token_id: str, limit: float, size_usdc: float,
                 fair: float, label: str) -> bool:
-    shares = round(size_usdc / limit, 4)  # Polymarket supports fractional shares
-    if shares < 0.01:                     # only block dust — not valid fractional orders
+    POLY_MIN_SHARES = 5                    # Polymarket CLOB rejects orders below 5 shares
+    shares = round(size_usdc / limit, 4)
+    if shares < POLY_MIN_SHARES:
+        shares = float(POLY_MIN_SHARES)
+        size_usdc = round(shares * limit, 4)  # bump USDC to afford minimum
+    if size_usdc < 0.01:                  # dust guard
         return False
 
     log.info(f"{'[DRY] ' if DRY_RUN else ''}BUY LIMIT  {label}  {shares}sh @ {limit:.3f}  (${size_usdc:.2f})")
