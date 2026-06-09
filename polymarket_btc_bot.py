@@ -382,10 +382,12 @@ def get_usdc_balance(client: ClobClient, wallet: str = "") -> float:
             BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
         )
         log.info(f"  CLOB balance raw: {resp}")
-        balance = float(
+        raw = float(
             resp.get("balance") or resp.get("available") or
             resp.get("allowance") or resp.get("amount") or 0
         )
+        # CLOB returns balance in raw token units (6 decimals) — convert to USDC
+        balance = raw / 1e6 if raw > 1000 else raw
         if balance == 0 and wallet:
             balance = get_usdc_balance_onchain(wallet)
         _balance_cache[0] = balance
