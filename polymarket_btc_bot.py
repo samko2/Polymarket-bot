@@ -702,6 +702,64 @@ def kelly_buy(fair: float, limit: float, bankroll: float) -> float:
 # CLOB CLIENT
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _get_proxy_wallet_address(eoa: str) -> str | None:
+    """
+    Try to discover the Polymarket proxy wallet address for this EOA.
+    The proxy address is needed as 'funder' for POLY_PROXY / POLY_1271 orders.
+    """
+    # Method 1: Gamma API accounts endpoint
+    try:
+        resp = requests.get(
+            f"{GAMMA_HOST}/accounts",
+            params={"address": eoa},
+            timeout=8,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            log.info(f"  Gamma accounts response: {data}")
+            if isinstance(data, list) and data:
+                item = data[0]
+            elif isinstance(data, dict):
+                item = data
+            else:
+                item = {}
+            for key in ("proxyWallet", "proxy_wallet", "proxy", "maker",
+                        "depositAddress", "deposit_address", "address"):
+                val = item.get(key)
+                if val and val.lower() != eoa.lower():
+                    log.info(f"  Found proxy via Gamma API [{key}]: {val}")
+                    return val
+    except Exception as e:
+        log.info(f"  Gamma accounts lookup failed: {e}")
+
+    # Method 2: Data API
+    try:
+        resp2 = requests.get(
+            f"{DATA_HOST}/accounts",
+            params={"address": eoa},
+            timeout=8,
+        )
+        if resp2.status_code == 200:
+            data2 = resp2.json()
+            log.info(f"  Data accounts response: {data2}")
+            if isinstance(data2, list) and data2:
+                item2 = data2[0]
+            elif isinstance(data2, dict):
+                item2 = data2
+            else:
+                item2 = {}
+            for key in ("proxyWallet", "proxy_wallet", "proxy", "maker",
+                        "depositAddress", "deposit_address"):
+                val = item2.get(key)
+                if val and val.lower() != eoa.lower():
+                    log.info(f"  Found proxy via Data API [{key}]: {val}")
+                    return val
+    except Exception as e:
+        log.info(f"  Data accounts lookup failed: {e}")
+
+    return None
+
+
 def build_client() -> ClobClient:
     pk = os.getenv("PK") or os.getenv("POLYMARKET_PRIVATE_KEY")
     if not pk: raise EnvironmentError("PK not set in .env")
@@ -709,19 +767,18 @@ def build_client() -> ClobClient:
     from eth_account import Account as _Acct
     from py_clob_client_v2 import SignatureTypeV2
     wallet = _Acct.from_key(pk).address
-    log.info(f"Wallet: {wallet}")
+    log.info(f"Wallet (EOA): {wallet}")
 
-    # ── Step 1: Derive EOA creds first (needed to authenticate balance scan) ──
+    # ── Step 1: Derive EOA creds (needed to authenticate balance scan) ────────
     log.info("Deriving EOA API credentials for balance scan…")
     eoa_tmp = ClobClient(host=CLOB_HOST, chain_id=CHAIN_ID, key=pk,
                          signature_type=0)
     eoa_creds = eoa_tmp.create_or_derive_api_key()
 
-    # ── Step 2: detect which signature type holds the funds ──────────────────
-    # Polymarket has 4 account types: EOA(0), POLY_PROXY(1), POLY_GNOSIS_SAFE(2), POLY_1271(3)
-    # The deposit wallet flow registers funds under one of these — find which one.
+    # ── Step 2: Detect which signature type holds the funds ──────────────────
     log.info("Scanning all signature types to find funded account…")
     detected_sig_type = None
+    raw_bal_response = {}
     for st in [SignatureTypeV2.EOA, SignatureTypeV2.POLY_PROXY,
                SignatureTypeV2.POLY_GNOSIS_SAFE, SignatureTypeV2.POLY_1271]:
         try:
@@ -731,35 +788,59 @@ def build_client() -> ClobClient:
                 params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL,
                                               signature_type=int(st))
             )
+            log.info(f"  Balance raw [{st.name}]: {bal}")   # log full dict
             usdc = float(bal.get("balance", 0)) / 1e6
             log.info(f"  Balance [{st.name}]: ${usdc:.2f}")
             if usdc > 0 and detected_sig_type is None:
                 detected_sig_type = int(st)
+                raw_bal_response = bal
                 log.info(f"  ✓ Funds found with {st.name} — using this mode")
         except Exception as e:
-            log.info(f"  Balance [{st.name}]: {e}")
+            log.info(f"  Balance [{st.name}]: error: {e}")
 
     if detected_sig_type is None:
-        log.warning("⚠️  CLOB shows $0 across all signature types. "
-                    "Go to polymarket.com → Deposit → From Wallet (Polygon) → "
-                    "deposit any USDC amount from Phantom to register this address.")
-        detected_sig_type = 0  # fall back to EOA
+        log.warning("⚠️  CLOB shows $0 across all signature types.")
+        detected_sig_type = 0
 
-    # ── Step 3: derive API key with the MATCHING signature type ──────────────
-    # The CLOB validates: order.signer must match the address of the API KEY.
-    # API keys are registered per (address, signature_type) — must derive with
-    # the same sig type we'll use when placing orders.
+    # ── Step 3: Discover proxy wallet address (needed as 'funder') ───────────
+    # For POLY_PROXY/POLY_1271: order.maker and order.signer must be the proxy
+    # contract address, not the EOA. Without it orders get "maker not allowed".
+    funder = None
+    if detected_sig_type != 0:
+        # Try to extract proxy addr from the balance response itself
+        for key in ("proxyWallet", "proxy_wallet", "proxy", "maker", "address"):
+            val = raw_bal_response.get(key)
+            if val and str(val).lower() not in (wallet.lower(), "", "0x0",
+                                                "0x0000000000000000000000000000000000000000"):
+                funder = val
+                log.info(f"  Proxy address from balance response [{key}]: {funder}")
+                break
+
+        if not funder:
+            log.info("  Proxy not in balance response — querying Polymarket APIs…")
+            funder = _get_proxy_wallet_address(wallet)
+
+        if funder:
+            log.info(f"  Using funder (proxy wallet): {funder}")
+        else:
+            log.warning("  ⚠️ Could not determine proxy wallet address. "
+                        "Orders may fail — set POLY_FUNDER env var to your proxy address.")
+            funder = os.getenv("POLY_FUNDER")  # manual override escape hatch
+
+    # ── Step 4: Derive API key with the matching signature type ───────────────
     if detected_sig_type == 0:
-        creds = eoa_creds  # reuse what we already have
+        creds = eoa_creds
         log.info("Using EOA API credentials for trading.")
     else:
         log.info(f"Re-deriving API credentials for signature_type={detected_sig_type}…")
         typed_tmp = ClobClient(host=CLOB_HOST, chain_id=CHAIN_ID, key=pk,
-                               signature_type=detected_sig_type)
+                               signature_type=detected_sig_type, funder=funder)
         creds = typed_tmp.create_or_derive_api_key()
 
     client = ClobClient(host=CLOB_HOST, chain_id=CHAIN_ID, key=pk, creds=creds,
-                        signature_type=detected_sig_type)
+                        signature_type=detected_sig_type, funder=funder)
+
+    log.info(f"Client ready — sig_type={detected_sig_type}, funder={funder or wallet}")
 
     try:
         client.update_balance_allowance(
