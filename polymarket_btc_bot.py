@@ -704,37 +704,48 @@ def build_client() -> ClobClient:
     pk = os.getenv("PK") or os.getenv("POLYMARKET_PRIVATE_KEY")
     if not pk: raise EnvironmentError("PK not set in .env")
 
-    # Always derive fresh credentials from PK — never use saved CLOB_API_KEY/SECRET/PASS_PHRASE
-    # (saved creds may be from a different key and cause "maker address not allowed")
+    from eth_account import Account as _Acct
+    from py_clob_client_v2 import SignatureTypeV2
+    wallet = _Acct.from_key(pk).address
+    log.info(f"Wallet: {wallet}")
+
     log.info("Deriving API credentials from PK…")
     tmp   = ClobClient(host=CLOB_HOST, chain_id=CHAIN_ID, key=pk)
     creds = tmp.create_or_derive_api_key()
 
-    client = ClobClient(host=CLOB_HOST, chain_id=CHAIN_ID, key=pk, creds=creds)
+    # ── Auto-detect the signature type that holds the funds ───────────────────
+    # Polymarket has 4 account types: EOA(0), POLY_PROXY(1), POLY_GNOSIS_SAFE(2), POLY_1271(3)
+    # The deposit wallet flow registers funds under one of these — find which one.
+    detected_sig_type = None
+    for st in [SignatureTypeV2.EOA, SignatureTypeV2.POLY_PROXY,
+               SignatureTypeV2.POLY_GNOSIS_SAFE, SignatureTypeV2.POLY_1271]:
+        try:
+            probe = ClobClient(host=CLOB_HOST, chain_id=CHAIN_ID, key=pk,
+                               creds=creds, signature_type=int(st))
+            bal = probe.get_balance_allowance(
+                params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL,
+                                              signature_type=int(st))
+            )
+            usdc = float(bal.get("balance", 0)) / 1e6
+            log.info(f"  Balance [{st.name}]: ${usdc:.2f}")
+            if usdc > 0 and detected_sig_type is None:
+                detected_sig_type = int(st)
+                log.info(f"  ✓ Funds found with {st.name} — using this mode")
+        except Exception as e:
+            log.info(f"  Balance [{st.name}]: {e}")
 
-    # ── Startup checks ────────────────────────────────────────────────────────
-    from eth_account import Account as _Acct
-    wallet = _Acct.from_key(pk).address
-    log.info(f"Wallet: {wallet}")
+    if detected_sig_type is None:
+        log.warning("⚠️  CLOB shows $0 across all signature types. "
+                    "Go to polymarket.com → Deposit → From Wallet (Polygon) → "
+                    "deposit any USDC amount from Phantom to register this address.")
+        detected_sig_type = None  # fall back to default EOA
+
+    client = ClobClient(host=CLOB_HOST, chain_id=CHAIN_ID, key=pk, creds=creds,
+                        signature_type=detected_sig_type)
 
     try:
-        bal = client.get_balance_allowance(
-            params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-        )
-        usdc = float(bal.get("balance", 0)) / 1e6
-        log.info(f"CLOB USDC balance: ${usdc:.2f}")
-        if usdc == 0:
-            log.warning("⚠️  CLOB shows $0 USDC. Complete the deposit wallet flow: "
-                        "polymarket.com → Deposit → From Wallet (Polygon) → deposit USDC "
-                        "from your Phantom wallet. This one-time step registers your address.")
-    except Exception as e:
-        log.info(f"  balance check: {e}")
-
-    try:
-        # Tell CLOB to re-read on-chain balance/allowance
         client.update_balance_allowance(
-            params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-        )
+            params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
     except Exception:
         pass
 
