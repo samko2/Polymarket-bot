@@ -60,10 +60,12 @@ TICK_SIZE  = "0.01"
 DRY_RUN               = False   # LIVE TRADING
 POLL_INTERVAL         = 20      # seconds between scans
 EDGE_BUFFER           = 0.03    # place limit this far below fair (3%)
-MIN_EDGE              = 0.005   # minimum net edge after fee (≥0.5% — 2% blocked all trades)
+MIN_EDGE              = 0.02    # minimum net edge after fee (2%)
 TAKER_FEE             = 0.02    # Polymarket taker fee on winnings
 KELLY_FRACTION        = 0.25    # quarter-Kelly
-MAX_BET_USDC          = 1.0     # hard cap per order
+MAX_BET_USDC          = 5.0     # hard cap per order
+TAKE_PROFIT           = 0.40    # exit when position up ≥40% from entry
+STOP_LOSS             = 0.40    # exit when position down ≥40% from entry
 MIN_BET_USDC          = 0.20    # skip orders below this ($0.50 blocked all kelly bets on $30 bankroll)
 MIN_VOLUME            = 5_000   # min market lifetime volume
 TRADED_RESET_HOURS    = 6       # full reset every N hours
@@ -251,10 +253,15 @@ class OrderManager:
     def __init__(self, existing_positions: set[str] = None):
         self.orders:          dict[str, TrackedOrder] = {}
         self.open_token_ids:  set[str] = set()
-        self.held_token_ids:  set[str] = existing_positions or set()  # from API on startup
+        # token_id → entry price (0.0 for positions loaded at startup with unknown entry)
+        self.held_positions:  dict[str, float] = {tid: 0.0 for tid in (existing_positions or set())}
         self.fills_usdc:      float = 0.0
         self.fill_count:      int   = 0
         self.order_count:     int   = 0
+
+    @property
+    def held_token_ids(self) -> set[str]:
+        return set(self.held_positions.keys())
 
     def record(self, order_id: str, token_id: str, label: str,
                limit: float, size_usdc: float, fair: float) -> None:
@@ -266,7 +273,7 @@ class OrderManager:
         return token_id in self.open_token_ids
 
     def already_holds(self, token_id: str) -> bool:
-        return token_id in self.held_token_ids
+        return token_id in self.held_positions
 
     def committed_usdc(self) -> float:
         """USDC locked in open (unfilled) orders."""
@@ -292,7 +299,7 @@ class OrderManager:
                         filled_usdc = round(size_matched * tracked.limit, 2)
                         self.fills_usdc += filled_usdc
                         self.fill_count += 1
-                        self.held_token_ids.add(tracked.token_id)
+                        self.held_positions[tracked.token_id] = tracked.limit  # entry price
                         fill_events.append({
                             "label":        tracked.label,
                             "limit":        tracked.limit,
@@ -341,6 +348,54 @@ class OrderManager:
         return (f"Orders: {self.order_count}  Fills: {self.fill_count}  "
                 f"Filled: ${self.fills_usdc:.2f}  Committed: ${self.committed_usdc():.2f}  "
                 f"Positions held: {len(self.held_token_ids)}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EXIT LOGIC — take-profit and stop-loss on held positions
+# ══════════════════════════════════════════════════════════════════════════════
+
+def scan_exit_positions(client: ClobClient, om: OrderManager) -> None:
+    """
+    Check all held positions against current bid price.
+    Sell if up ≥ TAKE_PROFIT or down ≥ STOP_LOSS from entry.
+    Entry price of 0.0 means we don't know it (startup load) — skip those.
+    """
+    if DRY_RUN:
+        return
+    for token_id, entry in list(om.held_positions.items()):
+        if entry <= 0:
+            continue  # unknown entry — can't evaluate exit
+        try:
+            bid, ask, _, liquid = get_order_book(token_id)
+            if not liquid or bid <= 0:
+                continue
+
+            gain = (bid - entry) / entry
+            if gain >= TAKE_PROFIT:
+                reason = f"take-profit (+{gain*100:.0f}%)"
+            elif gain <= -STOP_LOSS:
+                reason = f"stop-loss ({gain*100:.0f}%)"
+            else:
+                continue
+
+            # Sell at current bid (market-taker sell)
+            sell_price = round(bid, 4)
+            log.info(f"  🔴 EXIT {token_id[:12]}… entry={entry:.3f} bid={bid:.3f} → {reason}")
+            resp = client.create_and_post_order(
+                order_args=OrderArgs(token_id=token_id, price=sell_price,
+                                     side=Side.SELL, size=5.0),  # min 5 shares
+                options=PartialCreateOrderOptions(tick_size=TICK_SIZE),
+                order_type=OrderType.GTC,
+            )
+            if resp and resp.get("success"):
+                log.info(f"    ✓ Exit order placed: {resp.get('orderID','')[:20]}")
+                tg(f"🔴 <b>EXIT</b> {reason}\nentry={entry:.3f} → sell@{sell_price:.3f}\n"
+                   f"token={token_id[:16]}…")
+                om.held_positions.pop(token_id, None)
+            else:
+                log.warning(f"    ✗ Exit rejected: {resp}")
+        except Exception as e:
+            log.debug(f"  Exit scan {token_id[:12]}: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1112,21 +1167,76 @@ def _book_imbalance(binance_sym: str) -> float:
     return val
 
 
-def compute_hourly_fair(binance_sym: str) -> tuple:
+_hour_open_cache: dict[str, tuple[float, float]] = {}  # sym → (ts, open_price)
+_HOUR_OPEN_TTL = 120.0  # refresh every 2 min
+
+
+def _get_hour_open(binance_sym: str) -> float | None:
+    """Return the open price of the current 1h Binance candle (the hour reference price)."""
+    now = time.time()
+    cached = _hour_open_cache.get(binance_sym)
+    if cached and now - cached[0] < _HOUR_OPEN_TTL:
+        return cached[1]
+    try:
+        kline = retry_get(
+            "https://api.binance.com/api/v3/klines",
+            params={"symbol": binance_sym + "USDT", "interval": "1h", "limit": 1},
+            timeout=8,
+        ).json()
+        open_price = float(kline[0][1])  # index 1 = open price
+        _hour_open_cache[binance_sym] = (now, open_price)
+        return open_price
+    except Exception:
+        return None
+
+
+def compute_hourly_fair(binance_sym: str, spot: float = 0.0, mins_left: float = 999.0) -> tuple:
     """
     Return (fair_up, fair_down) for an hourly up/down market.
-    Momentum is the primary signal; order-book imbalance is secondary.
-    Clamped to [0.30, 0.70] — never extreme on a sub-hour bet.
+
+    Blends two signals:
+      1. Momentum + book-imbalance (always, primary when market is fresh)
+      2. Digital-option pricing off hour open (weighted heavier as expiry nears)
+         — "Is current price above where the hour opened?" is the actual settlement question.
+
+    Weight toward option pricing grows from 0% at 60+ min to 80% at 15 min.
+    Clamped to [0.25, 0.75].
     """
-    mom      = _hourly_momentum(binance_sym)
-    imb      = _book_imbalance(binance_sym)
-    fair_up  = 0.50 + 2.0 * mom + 0.08 * imb
-    fair_up  = round(max(0.30, min(0.70, fair_up)), 4)
+    mom     = _hourly_momentum(binance_sym)
+    imb     = _book_imbalance(binance_sym)
+    fair_mom = 0.50 + 2.0 * mom + 0.08 * imb
+    fair_mom = max(0.25, min(0.75, fair_mom))
+
+    # Option-pricing from hour open — only when we have spot and market has < 60 min left
+    fair_opt = None
+    if spot > 0 and mins_left < 60:
+        hour_open = _get_hour_open(binance_sym)
+        if hour_open and hour_open > 0:
+            T = max(0.5 / 60 / 24 / 365, mins_left / 60 / 24 / 365)  # years
+            vol = get_live_vol(binance_sym, 0.70, T)
+            # Zero drift for intraday; settlement = price above hour-open
+            p = european_prob(spot, hour_open, T, vol, 0.0, "up")
+            if p is not None:
+                fair_opt = p
+                log.debug(f"  Hourly opt [{binance_sym}]: S={spot:.2f} K={hour_open:.2f} "
+                          f"T={mins_left:.0f}m vol={vol*100:.0f}% → P(up)={p:.3f}")
+
+    if fair_opt is not None:
+        # Linearly ramp from 0% at 60 min to 80% at 15 min remaining
+        opt_weight = max(0.0, min(0.80, (60 - mins_left) / 56.25))
+        fair_up = opt_weight * fair_opt + (1 - opt_weight) * fair_mom
+        log.debug(f"  Hourly blend [{binance_sym}]: opt={fair_opt:.3f}×{opt_weight:.2f} "
+                  f"+ mom={fair_mom:.3f}×{1-opt_weight:.2f} = {fair_up:.3f}")
+    else:
+        fair_up = fair_mom
+
+    fair_up = round(max(0.25, min(0.75, fair_up)), 4)
     return fair_up, round(1 - fair_up, 4)
 
 
 MIN_HOURLY_VOLUME  = 200    # much lower bar than weekly/monthly markets
-MIN_HOURLY_MINS    = 20    # skip hourly markets with <20 min to expiry
+MIN_HOURLY_MINS    = 15    # skip hourly markets with <15 min to expiry
+HOURLY_EDGE_BUFFER = 0.015  # tighter than regular 3% — hourly fairs cluster near 50¢
 
 
 def is_hourly_updown(question: str) -> bool:
@@ -1202,6 +1312,7 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -
     """
     orders_placed = 0
     seen_tokens: set = set()
+    spot_map: dict[str, float] = {}   # cache spot per asset for this scan
 
     for m, asset, binance_sym in _collect_hourly_markets():
         question = m.get("question", "")
@@ -1210,7 +1321,7 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -
         if float(m.get("volume") or 0) < MIN_HOURLY_VOLUME:
             continue
 
-        # ── Skip markets about to expire (< 20 min left) ──────────────────
+        # ── Skip markets about to expire (< MIN_HOURLY_MINS left) ─────────
         mins_left = _hourly_mins_remaining(m)
         if mins_left < MIN_HOURLY_MINS:
             log.debug(f"    Skip expiring hourly ({mins_left:.0f}m left): {question[:40]}")
@@ -1233,7 +1344,14 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -
         if len(om.held_token_ids) >= MAX_POSITION_TOKENS:
             continue
 
-        fair_up, fair_down = compute_hourly_fair(binance_sym)
+        # ── Fetch spot (cached per asset) ─────────────────────────────────
+        if asset not in spot_map:
+            acfg = ASSETS.get(asset, {})
+            s = get_price(acfg.get("coingecko_id", ""), binance_sym)
+            spot_map[asset] = s or 0.0
+        spot = spot_map[asset]
+
+        fair_up, fair_down = compute_hourly_fair(binance_sym, spot, mins_left)
         tm       = re.search(r"\d{1,2}(?::\d{2})?\s*(?:am|pm)", question, re.I)
         time_str = tm.group(0) if tm else "?"
         log.info(f"  ⏰ {asset} hourly [{time_str} ET | {mins_left:.0f}m left] "
@@ -1248,7 +1366,7 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -
             if abs(fair_up - book_mid) > MAX_MODEL_MARKET_GAP:
                 log.debug(f"    Skip hourly UP: model={fair_up:.2f} book={book_mid:.2f}")
                 continue
-            limit    = round(max(bid + 0.01, fair_up - EDGE_BUFFER, 0.02), 2)
+            limit    = round(max(bid + 0.01, fair_up - HOURLY_EDGE_BUFFER, 0.02), 2)
             limit    = min(limit, ask - 0.01)
             net_edge = fair_up * (1 - TAKER_FEE) - limit
             label    = f"{asset} UP {time_str} ET (hourly)"
@@ -1264,7 +1382,7 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -
             if abs(fair_down - book_mid_dn) > MAX_MODEL_MARKET_GAP:
                 log.debug(f"    Skip hourly DOWN: model={fair_down:.2f} book={book_mid_dn:.2f}")
                 continue
-            limit    = round(max(bid_dn + 0.01, fair_down - EDGE_BUFFER, 0.02), 2)
+            limit    = round(max(bid_dn + 0.01, fair_down - HOURLY_EDGE_BUFFER, 0.02), 2)
             limit    = min(limit, ask_dn - 0.01)
             net_edge = fair_down * (1 - TAKER_FEE) - limit
             label    = f"{asset} DOWN {time_str} ET (hourly)"
@@ -1332,6 +1450,9 @@ def run_loop(client: ClobClient, wallet: str) -> None:
             tg(f"💰 <b>FILL</b>  {f['label']}\n"
                f"{f['size_matched']:.2f}sh @ {f['limit']:.3f} = ${f['filled_usdc']:.2f}\n"
                f"Fair: {f['fair']:.3f}  Edge: {f['edge_at_fill']:+.3f}")
+
+        # ── Exit held positions at take-profit / stop-loss ─────────────────────
+        scan_exit_positions(client, om)
 
         # ── Refresh balance every 5 min ────────────────────────────────────────
         if not DRY_RUN and MANUAL_BANKROLL == 0 and int(cycle_start) % 300 < POLL_INTERVAL:
