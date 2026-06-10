@@ -1472,17 +1472,76 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -
 # P&L TRACKER
 # ══════════════════════════════════════════════════════════════════════════════
 
+def get_positions_value(wallet: str) -> float:
+    """Total current market value of all held positions (Data API)."""
+    if not wallet:
+        return 0.0
+    try:
+        data = retry_get(
+            f"{DATA_HOST}/positions",
+            params={"user": wallet, "sizeThreshold": "0.01"},
+            timeout=12,
+        ).json()
+        total = 0.0
+        for p in (data if isinstance(data, list) else []):
+            val = p.get("currentValue") or p.get("current_value")
+            if val is not None:
+                total += float(val)
+            else:
+                size  = float(p.get("size") or 0)
+                price = float(p.get("curPrice") or p.get("price") or 0)
+                total += size * price
+        return round(total, 2)
+    except Exception as e:
+        log.debug(f"get_positions_value: {e}")
+        return 0.0
+
+
 class PnL:
-    def __init__(self):
-        self.start       = datetime.now(timezone.utc)
-        self.last_report = time.time()
+    def __init__(self, wallet: str = ""):
+        self.start          = datetime.now(timezone.utc)
+        self.last_report    = time.time()
+        self.wallet         = wallet
+        # Baselines snapshotted at startup / each report
+        self.last_portfolio = 0.0
+        self.last_fills     = 0
+        self.last_orders    = 0
+
+    def snapshot_baseline(self, bankroll: float) -> None:
+        """Call once after startup so the first report has a comparison point."""
+        self.last_portfolio = round(bankroll + get_positions_value(self.wallet), 2)
+        log.info(f"  P&L baseline: ${self.last_portfolio:.2f} (cash + positions)")
 
     def maybe_report(self, om: OrderManager, bankroll: float) -> None:
         if time.time() - self.last_report < PNL_REPORT_HOURS * 3600:
             return
-        uptime = str(datetime.now(timezone.utc) - self.start).split(".")[0]
-        log.info(f"[24h] uptime={uptime} {om.summary()} balance=${bankroll:.2f}")
-        self.last_report = time.time()
+
+        uptime    = str(datetime.now(timezone.utc) - self.start).split(".")[0]
+        pos_value = get_positions_value(self.wallet)
+        portfolio = round(bankroll + pos_value, 2)
+        change    = portfolio - self.last_portfolio if self.last_portfolio > 0 else 0.0
+        pct       = (change / self.last_portfolio * 100) if self.last_portfolio > 0 else 0.0
+        fills     = om.fill_count  - self.last_fills
+        orders    = om.order_count - self.last_orders
+        emoji     = "📈" if change >= 0 else "📉"
+
+        log.info(f"[24h] uptime={uptime} {om.summary()} "
+                 f"portfolio=${portfolio:.2f} ({change:+.2f})")
+
+        tg(f"{emoji} <b>DAILY P&L REPORT</b>\n"
+           f"━━━━━━━━━━━━━━━━━\n"
+           f"Portfolio: <b>${portfolio:.2f}</b>  ({change:+.2f} / {pct:+.1f}%)\n"
+           f"Cash: ${bankroll:.2f}  ·  Positions: ${pos_value:.2f}\n"
+           f"━━━━━━━━━━━━━━━━━\n"
+           f"24h orders: {orders}  ·  24h fills: {fills}\n"
+           f"Open positions: {len(om.held_positions)}\n"
+           f"Committed to open orders: ${om.committed_usdc():.2f}\n"
+           f"Uptime: {uptime}")
+
+        self.last_portfolio = portfolio
+        self.last_fills     = om.fill_count
+        self.last_orders    = om.order_count
+        self.last_report    = time.time()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1492,7 +1551,7 @@ class PnL:
 def run_loop(client: ClobClient, wallet: str) -> None:
     """Inner loop — runs until KeyboardInterrupt or unrecoverable error."""
     om  = OrderManager(get_existing_positions(wallet))
-    pnl = PnL()
+    pnl = PnL(wallet)
 
     if MANUAL_BANKROLL > 0:
         bankroll = MANUAL_BANKROLL
@@ -1502,6 +1561,7 @@ def run_loop(client: ClobClient, wallet: str) -> None:
     last_reset = time.time()
 
     log.info(f"Loop started. Balance: ${bankroll:.2f}  Positions loaded: {len(om.held_token_ids)}")
+    pnl.snapshot_baseline(bankroll)
 
     while True:
         cycle_start = time.time()
