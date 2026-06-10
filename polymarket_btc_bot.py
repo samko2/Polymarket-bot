@@ -354,11 +354,45 @@ class OrderManager:
 # EXIT LOGIC — take-profit and stop-loss on held positions
 # ══════════════════════════════════════════════════════════════════════════════
 
-def scan_exit_positions(client: ClobClient, om: OrderManager) -> None:
+_pos_size_cache: dict[str, tuple[float, float]] = {}  # token_id → (ts, shares)
+_POS_SIZE_TTL = 60.0
+
+
+def _get_position_size(wallet: str, token_id: str) -> float:
+    """
+    Query actual share count held for a token from the Data API.
+    Falls back to the 5-share minimum if the API can't be reached.
+    """
+    if not wallet:
+        return 5.0
+    now = time.time()
+    cached = _pos_size_cache.get(token_id)
+    if cached and now - cached[0] < _POS_SIZE_TTL:
+        return cached[1]
+    try:
+        data = retry_get(
+            f"{DATA_HOST}/positions",
+            params={"user": wallet, "asset": token_id, "sizeThreshold": "0.01"},
+            timeout=8,
+        ).json()
+        for p in (data if isinstance(data, list) else []):
+            tid  = p.get("asset") or p.get("token_id") or p.get("assetId", "")
+            size = float(p.get("size") or p.get("position") or 0)
+            if tid == token_id and size > 0:
+                _pos_size_cache[token_id] = (now, size)
+                log.debug(f"  Position size [{token_id[:12]}…]: {size:.2f} shares")
+                return size
+    except Exception as e:
+        log.debug(f"  _get_position_size failed: {e}")
+    return max(5.0, _pos_size_cache.get(token_id, (0, 5.0))[1])  # last known or minimum
+
+
+def scan_exit_positions(client: ClobClient, om: OrderManager, wallet: str = "") -> None:
     """
     Check all held positions against current bid price.
     Sell if up ≥ TAKE_PROFIT or down ≥ STOP_LOSS from entry.
     Entry price of 0.0 means we don't know it (startup load) — skip those.
+    Queries actual position size so the full holding is sold, not just 5 shares.
     """
     if DRY_RUN:
         return
@@ -378,20 +412,26 @@ def scan_exit_positions(client: ClobClient, om: OrderManager) -> None:
             else:
                 continue
 
-            # Sell at current bid (market-taker sell)
+            # Query actual share count so we sell the full position
+            shares = _get_position_size(wallet, token_id)
+            shares = max(5.0, round(shares, 2))   # CLOB minimum is 5 shares
+
             sell_price = round(bid, 4)
-            log.info(f"  🔴 EXIT {token_id[:12]}… entry={entry:.3f} bid={bid:.3f} → {reason}")
+            log.info(f"  🔴 EXIT {token_id[:12]}… entry={entry:.3f} bid={bid:.3f} "
+                     f"shares={shares:.2f} → {reason}")
             resp = client.create_and_post_order(
                 order_args=OrderArgs(token_id=token_id, price=sell_price,
-                                     side=Side.SELL, size=5.0),  # min 5 shares
+                                     side=Side.SELL, size=shares),
                 options=PartialCreateOrderOptions(tick_size=TICK_SIZE),
                 order_type=OrderType.GTC,
             )
             if resp and resp.get("success"):
                 log.info(f"    ✓ Exit order placed: {resp.get('orderID','')[:20]}")
-                tg(f"🔴 <b>EXIT</b> {reason}\nentry={entry:.3f} → sell@{sell_price:.3f}\n"
+                tg(f"🔴 <b>EXIT</b> {reason}\n"
+                   f"{shares:.2f}sh  entry={entry:.3f} → sell@{sell_price:.3f}\n"
                    f"token={token_id[:16]}…")
                 om.held_positions.pop(token_id, None)
+                _pos_size_cache.pop(token_id, None)
             else:
                 log.warning(f"    ✗ Exit rejected: {resp}")
         except Exception as e:
@@ -1167,6 +1207,36 @@ def _book_imbalance(binance_sym: str) -> float:
     return val
 
 
+_funding_cache: dict[str, tuple[float, float]] = {}  # sym → (ts, rate)
+_FUNDING_TTL = 300.0  # refresh every 5 min
+
+
+def _funding_rate(binance_sym: str) -> float:
+    """
+    Return the latest Binance perpetual funding rate for a symbol.
+    Positive = longs paying shorts = bullish market sentiment.
+    Typical range: -0.003 to +0.003 (i.e. -0.3% to +0.3%).
+    Cached for 5 minutes; returns 0.0 on any failure.
+    """
+    now = time.time()
+    cached = _funding_cache.get(binance_sym)
+    if cached and now - cached[0] < _FUNDING_TTL:
+        return cached[1]
+    try:
+        data = retry_get(
+            "https://fapi.binance.com/fapi/v1/fundingRate",
+            params={"symbol": binance_sym + "USDT", "limit": 1},
+            timeout=8,
+        ).json()
+        rate = float(data[0]["fundingRate"]) if data else 0.0
+        rate = max(-0.003, min(0.003, rate))
+        _funding_cache[binance_sym] = (now, rate)
+        log.debug(f"  Funding rate [{binance_sym}]: {rate*100:.4f}%")
+        return rate
+    except Exception:
+        return _funding_cache.get(binance_sym, (0, 0.0))[1]
+
+
 _hour_open_cache: dict[str, tuple[float, float]] = {}  # sym → (ts, open_price)
 _HOUR_OPEN_TTL = 120.0  # refresh every 2 min
 
@@ -1202,9 +1272,12 @@ def compute_hourly_fair(binance_sym: str, spot: float = 0.0, mins_left: float = 
     Weight toward option pricing grows from 0% at 60+ min to 80% at 15 min.
     Clamped to [0.25, 0.75].
     """
-    mom     = _hourly_momentum(binance_sym)
-    imb     = _book_imbalance(binance_sym)
-    fair_mom = 0.50 + 2.0 * mom + 0.08 * imb
+    mom  = _hourly_momentum(binance_sym)
+    imb  = _book_imbalance(binance_sym)
+    fund = _funding_rate(binance_sym)
+    # Funding rate scaled ×50: typical +0.01% (0.0001) → +0.005 nudge on fair
+    # Very bullish +0.10% → +0.05; capped by the outer clamp
+    fair_mom = 0.50 + 2.0 * mom + 0.08 * imb + 50.0 * fund
     fair_mom = max(0.25, min(0.75, fair_mom))
 
     # Option-pricing from hour open — only when we have spot and market has < 60 min left
@@ -1452,7 +1525,7 @@ def run_loop(client: ClobClient, wallet: str) -> None:
                f"Fair: {f['fair']:.3f}  Edge: {f['edge_at_fill']:+.3f}")
 
         # ── Exit held positions at take-profit / stop-loss ─────────────────────
-        scan_exit_positions(client, om)
+        scan_exit_positions(client, om, wallet)
 
         # ── Refresh balance every 5 min ────────────────────────────────────────
         if not DRY_RUN and MANUAL_BANKROLL == 0 and int(cycle_start) % 300 < POLL_INTERVAL:
@@ -1534,9 +1607,20 @@ def run_loop(client: ClobClient, wallet: str) -> None:
 
         pnl.maybe_report(om, bankroll)
 
+        # ── Adaptive sleep: 10s if any hourly market is within 30 min of expiry ──
+        try:
+            near_expiry = any(
+                _hourly_mins_remaining(m) < 30
+                for m, _, _ in _collect_hourly_markets()
+            )
+        except Exception:
+            near_expiry = False
+        effective_interval = 10 if near_expiry else POLL_INTERVAL
+
         elapsed   = time.time() - cycle_start
-        sleep_for = max(1.0, POLL_INTERVAL - elapsed)
-        log.info(f"Cycle {elapsed:.1f}s — next in {sleep_for:.0f}s  |  {om.summary()}\n{'='*72}")
+        sleep_for = max(1.0, effective_interval - elapsed)
+        log.info(f"Cycle {elapsed:.1f}s — next in {sleep_for:.0f}s"
+                 f"{' ⚡fast' if near_expiry else ''}  |  {om.summary()}\n{'='*72}")
 
         try:
             time.sleep(sleep_for)
