@@ -211,27 +211,31 @@ def get_wallet_address(pk: str) -> str:
         return ""
 
 
-def get_existing_positions(wallet: str) -> set[str]:
-    """Fetch token IDs where we already hold a position. Skips these on entry."""
+def get_existing_positions(wallet: str) -> dict[str, float]:
+    """
+    Fetch held positions as {token_id: avg_entry_price}. Skips these on entry.
+    Entry price from the API lets exit logic work across bot restarts.
+    NOTE: wallet must be the PROXY address — positions live under it, not the EOA.
+    """
     if not wallet:
-        return set()
+        return {}
     try:
         data = retry_get(
             f"{DATA_HOST}/positions",
             params={"user": wallet, "sizeThreshold": "0.01"},
             timeout=12,
         ).json()
-        held = set()
+        held: dict[str, float] = {}
         for p in (data if isinstance(data, list) else []):
             tid  = p.get("asset") or p.get("token_id") or p.get("assetId", "")
             size = float(p.get("size") or p.get("position") or 0)
             if tid and size > 0.01:
-                held.add(tid)
+                held[tid] = float(p.get("avgPrice") or p.get("avg_price") or 0)
         log.info(f"  Existing positions loaded: {len(held)} token(s)")
         return held
     except Exception as e:
         log.warning(f"Could not load positions: {e}")
-        return set()
+        return {}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -250,11 +254,11 @@ class TrackedOrder:
 
 
 class OrderManager:
-    def __init__(self, existing_positions: set[str] = None):
+    def __init__(self, existing_positions: dict[str, float] = None):
         self.orders:          dict[str, TrackedOrder] = {}
         self.open_token_ids:  set[str] = set()
-        # token_id → entry price (0.0 for positions loaded at startup with unknown entry)
-        self.held_positions:  dict[str, float] = {tid: 0.0 for tid in (existing_positions or set())}
+        # token_id → avg entry price (0.0 = unknown, exit logic skips those)
+        self.held_positions:  dict[str, float] = dict(existing_positions or {})
         self.fills_usdc:      float = 0.0
         self.fill_count:      int   = 0
         self.order_count:     int   = 0
@@ -1051,6 +1055,16 @@ def process_market(client: ClobClient, om: OrderManager,
         log.debug(f"  Skip {label[:40]}: model={fair:.2f} book_mid={book_mid:.2f} gap={gap:.2f}")
         return None
 
+    # Never fade near-resolved markets — when the crowd prices ≥92% certainty,
+    # buying the cheap side is a lottery ticket with negative expectancy
+    if book_mid >= 0.92 or book_mid <= 0.08:
+        log.debug(f"  Skip {label[:40]}: near-resolved (mid={book_mid:.2f})")
+        return None
+
+    # Shrink model toward market price — the book aggregates information our
+    # model doesn't have; pure model overestimates tail probabilities
+    fair = round(0.70 * fair + 0.30 * book_mid, 4)
+
     result = dict(question=question[:65], direction=direction, strike=strike,
                   fair=fair, book_mid=book_mid, gap=round(gap, 3), volume=volume,
                   T_days=T*365, model=model, action=None, traded=False,
@@ -1307,9 +1321,11 @@ def compute_hourly_fair(binance_sym: str, spot: float = 0.0, mins_left: float = 
     return fair_up, round(1 - fair_up, 4)
 
 
-MIN_HOURLY_VOLUME  = 200    # much lower bar than weekly/monthly markets
-MIN_HOURLY_MINS    = 15    # skip hourly markets with <15 min to expiry
+MIN_HOURLY_VOLUME  = 10     # hourly markets are new each hour — volume is always tiny early
+MIN_HOURLY_MINS    = 15     # skip hourly markets with <15 min to expiry
 HOURLY_EDGE_BUFFER = 0.015  # tighter than regular 3% — hourly fairs cluster near 50¢
+MAX_HOURLY_SPREAD  = 0.30   # require a real two-sided book (skip 0.01/0.99 empty shells)
+MIN_HOURLY_BID     = 0.05   # require a real bid — avoids adverse selection in dead books
 
 
 def is_hourly_updown(question: str) -> bool:
@@ -1436,6 +1452,9 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -
             bid, ask, book_mid, liquid = get_order_book(token_up)
             if not liquid:
                 continue
+            if (ask - bid) > MAX_HOURLY_SPREAD or bid < MIN_HOURLY_BID:
+                log.debug(f"    Skip hourly UP: dead book bid={bid:.2f} ask={ask:.2f}")
+                continue
             if abs(fair_up - book_mid) > MAX_MODEL_MARKET_GAP:
                 log.debug(f"    Skip hourly UP: model={fair_up:.2f} book={book_mid:.2f}")
                 continue
@@ -1451,6 +1470,9 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -
         else:
             bid_dn, ask_dn, book_mid_dn, liquid_dn = get_order_book(token_down)
             if not liquid_dn:
+                continue
+            if (ask_dn - bid_dn) > MAX_HOURLY_SPREAD or bid_dn < MIN_HOURLY_BID:
+                log.debug(f"    Skip hourly DOWN: dead book bid={bid_dn:.2f} ask={ask_dn:.2f}")
                 continue
             if abs(fair_down - book_mid_dn) > MAX_MODEL_MARKET_GAP:
                 log.debug(f"    Skip hourly DOWN: model={fair_down:.2f} book={book_mid_dn:.2f}")
@@ -1702,11 +1724,17 @@ def run() -> None:
     if wallet:
         log.info(f"Wallet: {wallet}")
 
+    # Positions/balances live under the PROXY wallet, not the EOA —
+    # all Data API queries must use it or they return empty.
+    data_wallet = os.getenv("POLY_FUNDER") or _get_proxy_wallet_address(wallet) or wallet
+    if data_wallet != wallet:
+        log.info(f"Data wallet (proxy): {data_wallet}")
+
     restart_delay = 30
     while True:
         try:
             client = build_client()
-            run_loop(client, wallet)
+            run_loop(client, data_wallet)
         except KeyboardInterrupt:
             log.info("Stopped by user.")
             tg("🛑 <b>Bot stopped</b> (KeyboardInterrupt)")
