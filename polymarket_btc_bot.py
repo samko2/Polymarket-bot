@@ -242,6 +242,52 @@ def get_existing_positions(wallet: str) -> dict[str, float] | None:
         return None
 
 
+def get_recent_buys(wallet: str, hours: float = 2.0) -> dict[str, float]:
+    """
+    Net recently-bought tokens from the activity feed: {token_id: avg_buy_price}.
+    The activity feed indexes near-instantly, unlike /positions which can lag
+    minutes behind — without this, a restart right after a fill makes the bot
+    forget the position and buy it again.
+    """
+    if not wallet:
+        return {}
+    try:
+        data = retry_get(
+            f"{DATA_HOST}/activity",
+            params={"user": wallet, "limit": "60"},
+            timeout=12,
+        ).json()
+        cutoff = time.time() - hours * 3600
+        net:    dict[str, float] = {}   # token → net shares (buys − sells)
+        bought: dict[str, float] = {}   # token → total shares bought
+        cost:   dict[str, float] = {}   # token → total buy cost
+        for a in (data if isinstance(data, list) else []):
+            if a.get("type") != "TRADE" or float(a.get("timestamp") or 0) < cutoff:
+                continue
+            tid   = a.get("asset") or a.get("token_id", "")
+            size  = float(a.get("size") or 0)
+            price = float(a.get("price") or 0)
+            if not tid or size <= 0:
+                continue
+            if a.get("side") == "BUY":
+                net[tid]    = net.get(tid, 0) + size
+                bought[tid] = bought.get(tid, 0) + size
+                cost[tid]   = cost.get(tid, 0) + size * price
+            else:
+                net[tid]  = net.get(tid, 0) - size
+        recent = {}
+        for tid, shares in net.items():
+            if shares > 0.01 and bought.get(tid, 0) > 0:
+                avg_buy = cost[tid] / bought[tid]   # true avg buy price
+                recent[tid] = round(min(0.99, avg_buy), 4)
+        if recent:
+            log.info(f"  Recent buys merged from activity feed: {len(recent)} token(s)")
+        return recent
+    except Exception as e:
+        log.debug(f"get_recent_buys: {e}")
+        return {}
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ORDER MANAGER
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1613,6 +1659,12 @@ class PnL:
 def run_loop(client: ClobClient, wallet: str) -> None:
     """Inner loop — runs until KeyboardInterrupt or unrecoverable error."""
     om  = OrderManager(get_existing_positions(wallet))
+    # Merge fills from the last 2h that /positions may not have indexed yet —
+    # prevents double-buying the same market right after a restart
+    for tid, entry in get_recent_buys(wallet).items():
+        if tid not in om.held_positions:
+            om.held_positions[tid] = entry
+            om.recent_fill_ts[tid] = time.time()
     pnl = PnL(wallet)
 
     if MANUAL_BANKROLL > 0:
