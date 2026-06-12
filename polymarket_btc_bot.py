@@ -280,7 +280,12 @@ class OrderManager:
             return  # API failure — keep current state
         now = time.time()
         for tid, entry in api.items():
-            if tid not in self.held_positions or self.held_positions[tid] <= 0:
+            if tid not in self.held_positions:
+                # Newly discovered mid-session — avgPrice may be stale right
+                # after a fill, so start the hold-time clock before any exit
+                self.held_positions[tid] = entry
+                self.recent_fill_ts[tid] = now
+            elif self.held_positions[tid] <= 0:
                 self.held_positions[tid] = entry
         for tid in list(self.held_positions):
             if tid not in api and now - self.recent_fill_ts.get(tid, 0) > 900:
@@ -428,6 +433,8 @@ def scan_exit_positions(client: ClobClient, om: OrderManager, wallet: str = "") 
     for token_id, entry in list(om.held_positions.items()):
         if entry <= 0:
             continue  # unknown entry — can't evaluate exit
+        if time.time() - om.recent_fill_ts.get(token_id, 0) < 900:
+            continue  # held <15 min — entry price may not be settled yet
         try:
             bid, ask, _, liquid = get_order_book(token_id)
             if not liquid or bid < 0.05:
