@@ -73,6 +73,8 @@ STALE_FAIR_DRIFT      = 0.12    # cancel order if fair drifted >12%
 PNL_REPORT_HOURS      = 24
 MAX_MODEL_MARKET_GAP  = 0.30    # skip if model and book-mid disagree >30%
 MIN_BOOK_LIQUIDITY    = 0.01    # skip markets with spread wider than 99 cents
+MAX_BOOK_SPREAD       = 0.25    # require a real two-sided book on regular markets too
+POSITION_SYNC_MINS    = 10      # re-sync held positions from Data API every N minutes
 MAX_POSITION_TOKENS   = 50      # max distinct token positions held at once
 MANUAL_BANKROLL       = float(os.getenv("MANUAL_BANKROLL", "0"))  # override balance check if set
 
@@ -188,8 +190,9 @@ def get_order_book(token_id: str) -> tuple[float, float, float, bool]:
         data     = retry_get(f"{CLOB_HOST}/book", params={"token_id": token_id}, timeout=8).json()
         bids     = data.get("bids", [])
         asks     = data.get("asks", [])
-        best_bid = float(bids[0]["price"]) if bids else 0.0
-        best_ask = float(asks[0]["price"]) if asks else 1.0
+        # Polymarket sorts book arrays with the BEST price LAST (worst first)
+        best_bid = max(float(b["price"]) for b in bids) if bids else 0.0
+        best_ask = min(float(a["price"]) for a in asks) if asks else 1.0
         mid      = round((best_bid + best_ask) / 2, 4)
         liquid   = bool(bids and asks and (best_ask - best_bid) <= (1.0 - MIN_BOOK_LIQUIDITY))
         result   = (best_bid, best_ask, mid, liquid)
@@ -211,11 +214,12 @@ def get_wallet_address(pk: str) -> str:
         return ""
 
 
-def get_existing_positions(wallet: str) -> dict[str, float]:
+def get_existing_positions(wallet: str) -> dict[str, float] | None:
     """
     Fetch held positions as {token_id: avg_entry_price}. Skips these on entry.
     Entry price from the API lets exit logic work across bot restarts.
     NOTE: wallet must be the PROXY address — positions live under it, not the EOA.
+    Returns None on API failure (vs {} for a genuinely empty account).
     """
     if not wallet:
         return {}
@@ -235,7 +239,7 @@ def get_existing_positions(wallet: str) -> dict[str, float]:
         return held
     except Exception as e:
         log.warning(f"Could not load positions: {e}")
-        return {}
+        return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -259,9 +263,29 @@ class OrderManager:
         self.open_token_ids:  set[str] = set()
         # token_id → avg entry price (0.0 = unknown, exit logic skips those)
         self.held_positions:  dict[str, float] = dict(existing_positions or {})
+        self.recent_fill_ts:  dict[str, float] = {}   # token_id → fill time
         self.fills_usdc:      float = 0.0
         self.fill_count:      int   = 0
         self.order_count:     int   = 0
+
+    def sync_positions(self, wallet: str) -> None:
+        """
+        Re-sync held positions from the Data API so memory matches reality —
+        catches unfilled exit sells, manual trades, and fills missed across
+        restarts. Fills from the last 15 min are protected from removal
+        (the API may not have indexed them yet).
+        """
+        api = get_existing_positions(wallet)
+        if api is None:
+            return  # API failure — keep current state
+        now = time.time()
+        for tid, entry in api.items():
+            if tid not in self.held_positions or self.held_positions[tid] <= 0:
+                self.held_positions[tid] = entry
+        for tid in list(self.held_positions):
+            if tid not in api and now - self.recent_fill_ts.get(tid, 0) > 900:
+                self.held_positions.pop(tid)
+                log.info(f"  Position sync: {tid[:12]}… no longer held — removed")
 
     @property
     def held_token_ids(self) -> set[str]:
@@ -304,6 +328,7 @@ class OrderManager:
                         self.fills_usdc += filled_usdc
                         self.fill_count += 1
                         self.held_positions[tracked.token_id] = tracked.limit  # entry price
+                        self.recent_fill_ts[tracked.token_id] = time.time()
                         fill_events.append({
                             "label":        tracked.label,
                             "limit":        tracked.limit,
@@ -405,8 +430,10 @@ def scan_exit_positions(client: ClobClient, om: OrderManager, wallet: str = "") 
             continue  # unknown entry — can't evaluate exit
         try:
             bid, ask, _, liquid = get_order_book(token_id)
-            if not liquid or bid <= 0:
-                continue
+            if not liquid or bid < 0.05:
+                continue  # no real bid / dust position — not worth selling
+            if (ask - bid) > 0.30:
+                continue  # one-sided book — bid is unreliable, don't exit into it
 
             gain = (bid - entry) / entry
             if gain >= TAKE_PROFIT:
@@ -420,7 +447,8 @@ def scan_exit_positions(client: ClobClient, om: OrderManager, wallet: str = "") 
             shares = _get_position_size(wallet, token_id)
             shares = max(5.0, round(shares, 2))   # CLOB minimum is 5 shares
 
-            sell_price = round(bid, 4)
+            # Floor to 1¢ tick — and cap at 0.99 (1.00 is not a valid price)
+            sell_price = min(0.99, max(0.01, math.floor(bid * 100) / 100))
             log.info(f"  🔴 EXIT {token_id[:12]}… entry={entry:.3f} bid={bid:.3f} "
                      f"shares={shares:.2f} → {reason}")
             resp = client.create_and_post_order(
@@ -1047,6 +1075,11 @@ def process_market(client: ClobClient, om: OrderManager,
     bid, ask, book_mid, liquid = get_order_book(token_yes)
     if not liquid:
         return None  # dead market, no counterparty
+    if (ask - bid) > MAX_BOOK_SPREAD:
+        # Empty-shell book (e.g. 0.01/0.99) — mid is meaningless and there's
+        # no real counterparty; trading here is pure adverse selection
+        log.debug(f"  Skip {label[:40]}: dead book bid={bid:.2f} ask={ask:.2f}")
+        return None
 
     # Always compare YES vs YES — gap is the same whether measured from YES or NO side
     gap = abs(fair - book_mid)
@@ -1584,6 +1617,7 @@ def run_loop(client: ClobClient, wallet: str) -> None:
 
     log.info(f"Loop started. Balance: ${bankroll:.2f}  Positions loaded: {len(om.held_token_ids)}")
     pnl.snapshot_baseline(bankroll)
+    last_pos_sync = time.time()
 
     while True:
         cycle_start = time.time()
@@ -1605,6 +1639,11 @@ def run_loop(client: ClobClient, wallet: str) -> None:
             tg(f"💰 <b>FILL</b>  {f['label']}\n"
                f"{f['size_matched']:.2f}sh @ {f['limit']:.3f} = ${f['filled_usdc']:.2f}\n"
                f"Fair: {f['fair']:.3f}  Edge: {f['edge_at_fill']:+.3f}")
+
+        # ── Re-sync positions from API so memory matches reality ───────────────
+        if cycle_start - last_pos_sync > POSITION_SYNC_MINS * 60:
+            om.sync_positions(wallet)
+            last_pos_sync = cycle_start
 
         # ── Exit held positions at take-profit / stop-loss ─────────────────────
         scan_exit_positions(client, om, wallet)
