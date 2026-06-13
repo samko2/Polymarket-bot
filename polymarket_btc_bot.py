@@ -19,6 +19,7 @@ import logging
 from collections import defaultdict, deque
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field
+from email.utils import parsedate_to_datetime
 
 import requests
 from dotenv import load_dotenv
@@ -1623,6 +1624,113 @@ def _get_hour_open(binance_sym: str) -> float | None:
         return None
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# NEWS SENTIMENT  —  CoinTelegraph + CoinDesk RSS (no API key required)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_BULLISH_WORDS = frozenset([
+    "surge", "rally", "pump", "breakout", "ath", "all-time high",
+    "gain", "rise", "bull", "etf", "approval", "approved", "adopt",
+    "upgrade", "halving", "record", "inflow", "launch", "partnership",
+    "accumulate", "accumulation", "support",
+])
+_BEARISH_WORDS = frozenset([
+    "crash", "hack", "hacked", "ban", "plunge", "drop", "dump", "bear",
+    "fear", "warning", "collapse", "exploit", "breach", "sec", "lawsuit",
+    "loss", "outflow", "scam", "fraud", "fine", "penalty",
+    "liquidat", "bankrupt", "attack", "stolen", "vulnerab",
+])
+_ASSET_NEWS_KEYWORDS = {
+    "BTC": ["bitcoin"],
+    "ETH": ["ethereum"],
+    "SOL": ["solana"],
+}
+_RSS_FEEDS = [
+    "https://cointelegraph.com/rss",
+    "https://www.coindesk.com/arc/outboundfeeds/rss/",
+]
+
+
+def _headline_score(text: str) -> float:
+    hl = text.lower()
+    score = 0.0
+    for w in _BULLISH_WORDS:
+        if w in hl:
+            score += 0.3
+    for w in _BEARISH_WORDS:
+        if w in hl:
+            score -= 0.3
+    return max(-1.0, min(1.0, score))
+
+
+class _NewsCache:
+    def __init__(self):
+        self._ts:     float            = 0.0
+        self._scores: dict[str, float] = {"BTC": 0.0, "ETH": 0.0, "SOL": 0.0}
+
+    def _parse_pub_date(self, raw: str) -> float:
+        try:
+            return parsedate_to_datetime(raw.strip()).timestamp()
+        except Exception:
+            return 0.0
+
+    def _fetch(self) -> dict[str, float]:
+        cutoff = time.time() - _NEWS_WINDOW
+        totals: dict[str, list[float]] = {k: [] for k in _ASSET_NEWS_KEYWORDS}
+        for feed in _RSS_FEEDS:
+            try:
+                r = requests.get(
+                    feed, timeout=10,
+                    headers={"User-Agent": "Mozilla/5.0"},
+                )
+                if r.status_code != 200:
+                    continue
+                items = re.findall(r"<item>(.*?)</item>", r.text, re.DOTALL)
+                for item in items:
+                    tm = re.search(
+                        r"<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>",
+                        item, re.DOTALL,
+                    )
+                    dm = re.search(r"<pubDate>(.*?)</pubDate>", item)
+                    if not tm:
+                        continue
+                    title  = tm.group(1).strip()
+                    pub_ts = self._parse_pub_date(dm.group(1)) if dm else 0.0
+                    if pub_ts and pub_ts < cutoff:
+                        continue
+                    score = _headline_score(title)
+                    hl    = title.lower()
+                    for asset, kws in _ASSET_NEWS_KEYWORDS.items():
+                        if any(kw in hl for kw in kws):
+                            totals[asset].append(score)
+            except Exception as e:
+                log.debug(f"  RSS {feed} failed: {e}")
+
+        result: dict[str, float] = {}
+        for asset, scores_list in totals.items():
+            if scores_list:
+                raw = sum(scores_list) / len(scores_list)
+                result[asset] = round(max(-1.0, min(1.0, raw)), 3)
+            else:
+                result[asset] = 0.0
+        return result
+
+    def get(self) -> dict[str, float]:
+        if time.time() - self._ts >= _NEWS_TTL:
+            self._scores = self._fetch()
+            self._ts     = time.time()
+            log.info(
+                f"  News sentiment (2h): "
+                f"BTC={self._scores['BTC']:+.2f}  "
+                f"ETH={self._scores['ETH']:+.2f}  "
+                f"SOL={self._scores['SOL']:+.2f}"
+            )
+        return self._scores
+
+
+_news_cache = _NewsCache()
+
+
 def compute_hourly_fair(binance_sym: str, spot: float = 0.0, mins_left: float = 999.0) -> tuple:
     """
     Return (fair_up, fair_down) for an hourly up/down market.
@@ -1638,9 +1746,10 @@ def compute_hourly_fair(binance_sym: str, spot: float = 0.0, mins_left: float = 
     mom  = _hourly_momentum(binance_sym)
     imb  = _book_imbalance(binance_sym)
     fund = _funding_rate(binance_sym)
+    news = _news_cache.get().get(binance_sym, 0.0) * NEWS_FAIR_NUDGE
     # Funding rate scaled ×50: typical +0.01% (0.0001) → +0.005 nudge on fair
-    # Very bullish +0.10% → +0.05; capped by the outer clamp
-    fair_mom = 0.50 + 2.0 * mom + 0.08 * imb + 50.0 * fund
+    # News nudge: max ±3¢ shift from recent 2h headlines (capped by outer clamp)
+    fair_mom = 0.50 + 2.0 * mom + 0.08 * imb + 50.0 * fund + news
     fair_mom = max(0.25, min(0.75, fair_mom))
 
     # Option-pricing from hour open — only when we have spot and market has < 60 min left
@@ -1678,6 +1787,10 @@ MIN_HOURLY_BID       = 0.05   # require a real bid — avoids adverse selection 
 MIN_HOURLY_CONVICTION = 0.55  # require ≥55¢ fair before entering — no near-coinflip bets
 MIN_HOURLY_EDGE      = 0.03   # hourly markets need more edge than regular (noisier signal)
 MAX_HOURLY_BET_USDC  = 3.0    # cap hourly bets lower than regular $5 max
+NEWS_FAIR_NUDGE  = 0.03   # max ±3¢ shift on hourly fair from news sentiment
+NEWS_VETO_SCORE  = 0.60   # block entry when news strongly opposes direction (≥2 strong keywords)
+_NEWS_TTL        = 600    # re-fetch RSS every 10 minutes
+_NEWS_WINDOW     = 7200   # only count articles published in the last 2 hours
 
 
 def is_hourly_updown(question: str) -> bool:
@@ -1804,15 +1917,19 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -
         spot = spot_map[asset]
 
         fair_up, fair_down = compute_hourly_fair(binance_sym, spot, mins_left)
+        news_score = _news_cache.get().get(asset, 0.0)
         tm       = re.search(r"\d{1,2}(?::\d{2})?\s*(?:am|pm)", question, re.I)
         time_str = tm.group(0) if tm else "?"
         log.info(f"  ⏰ {asset} hourly [{time_str} ET | {mins_left:.0f}m left] "
-                 f"fair_up={fair_up:.3f} fair_dn={fair_down:.3f}  {question[:45]}")
+                 f"fair_up={fair_up:.3f} fair_dn={fair_down:.3f} "
+                 f"news={news_score:+.2f}  {question[:40]}")
 
         available = free_bankroll(bankroll, om)
 
         if fair_up >= MIN_HOURLY_CONVICTION:
-            if up_on_cd:
+            if news_score <= -NEWS_VETO_SCORE:
+                log.info(f"    Skip {asset} UP: news bearish ({news_score:+.2f})")
+            elif up_on_cd:
                 log.info(f"    Skip {asset} UP: loss cooldown active")
             else:
                 bid, ask, book_mid, liquid = get_order_book(token_up)
@@ -1833,7 +1950,9 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -
                             if place_order(client, om, token_up, limit, size, fair_up, label):
                                 orders_placed += 1
         elif fair_down >= MIN_HOURLY_CONVICTION:
-            if dn_on_cd:
+            if news_score >= NEWS_VETO_SCORE:
+                log.info(f"    Skip {asset} DOWN: news bullish ({news_score:+.2f})")
+            elif dn_on_cd:
                 log.info(f"    Skip {asset} DOWN: loss cooldown active")
             else:
                 bid_dn, ask_dn, book_mid_dn, liquid_dn = get_order_book(token_down)
