@@ -148,7 +148,7 @@ _drift_cache: dict = {}
 _book_cache:  dict = {}
 _imb_cache:   dict = {}   # Binance book-imbalance cache
 SLUG_TTL  = 300
-BOOK_TTL  = 15    # order books stale quickly
+BOOK_TTL  = 25    # longer than POLL_INTERVAL so cache survives across cycles
 SLUG_MAX  = 2000  # evict oldest entries beyond this to prevent memory growth
 IMB_TTL   = 60    # imbalance re-fetched once per minute
 
@@ -194,7 +194,11 @@ def get_order_book(token_id: str) -> tuple[float, float, float, bool]:
         best_bid = max(float(b["price"]) for b in bids) if bids else 0.0
         best_ask = min(float(a["price"]) for a in asks) if asks else 1.0
         mid      = round((best_bid + best_ask) / 2, 4)
-        liquid   = bool(bids and asks and (best_ask - best_bid) <= (1.0 - MIN_BOOK_LIQUIDITY))
+        # liquid = True when there is a real two-sided book (spread < 95 cents)
+        # The old check used (1.0 - MIN_BOOK_LIQUIDITY) = 0.99, which accepted dead
+        # 0.01/0.99 books (spread = 0.98 ≤ 0.99). Now we require spread < 0.95.
+        liquid   = bool(bids and asks and best_bid > 0 and best_ask < 1
+                        and (best_ask - best_bid) < 0.95)
         result   = (best_bid, best_ask, mid, liquid)
         _book_cache[token_id] = (now, result)
         return result
@@ -327,10 +331,11 @@ class OrderManager:
         now = time.time()
         for tid, entry in api.items():
             if tid not in self.held_positions:
-                # Newly discovered mid-session — avgPrice may be stale right
-                # after a fill, so start the hold-time clock before any exit
+                # Position found in API but not in memory — could be from days ago
+                # (restart/rediscovery). Do NOT stamp recent_fill_ts here; only
+                # refresh_from_api stamps it for confirmed fresh fills. This avoids
+                # blocking exit logic for 15 min on positions held for days.
                 self.held_positions[tid] = entry
-                self.recent_fill_ts[tid] = now
             elif self.held_positions[tid] <= 0:
                 self.held_positions[tid] = entry
         for tid in list(self.held_positions):
@@ -375,10 +380,17 @@ class OrderManager:
                     size_matched = float(detail.get("size_matched") or 0)
                     status       = detail.get("status", "UNKNOWN")
                     if size_matched > 0.001:
-                        filled_usdc = round(size_matched * tracked.limit, 2)
+                        # Use actual average fill price when available — limit price is
+                        # only an approximation (partial fills may average lower)
+                        fill_price = float(
+                            detail.get("average_price") or detail.get("avg_price") or
+                            detail.get("price") or tracked.limit
+                        )
+                        fill_price = max(0.01, min(0.99, fill_price))
+                        filled_usdc = round(size_matched * fill_price, 2)
                         self.fills_usdc += filled_usdc
                         self.fill_count += 1
-                        self.held_positions[tracked.token_id] = tracked.limit  # entry price
+                        self.held_positions[tracked.token_id] = fill_price  # true entry price
                         self.recent_fill_ts[tracked.token_id] = time.time()
                         fill_events.append({
                             "label":        tracked.label,
@@ -497,8 +509,13 @@ def scan_exit_positions(client: ClobClient, om: OrderManager, wallet: str = "") 
                 continue
 
             # Query actual share count so we sell the full position
-            shares = _get_position_size(wallet, token_id)
-            shares = max(5.0, round(shares, 2))   # CLOB minimum is 5 shares
+            shares = round(_get_position_size(wallet, token_id), 2)
+            if shares < 5.0:
+                # CLOB minimum is 5 shares — can't exit a sub-5-share position;
+                # inflating the size would oversell beyond what we actually hold
+                log.info(f"  Skip exit {token_id[:12]}…: position too small "
+                         f"({shares:.2f}sh < 5 CLOB minimum)")
+                continue
 
             # Floor to 1¢ tick — and cap at 0.99 (1.00 is not a valid price)
             sell_price = min(0.99, max(0.01, math.floor(bid * 100) / 100))
@@ -1016,6 +1033,21 @@ def build_client() -> ClobClient:
 # ORDER PLACEMENT
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Polymarket enforces 60 orders/minute per API key
+_order_ts_window: list[float] = []
+_RATE_LIMIT_PER_MIN = 55  # stay 5 under the hard cap
+
+
+def _rate_limit_ok() -> bool:
+    now = time.time()
+    _order_ts_window[:] = [t for t in _order_ts_window if now - t < 60]
+    if len(_order_ts_window) >= _RATE_LIMIT_PER_MIN:
+        log.warning(f"  Rate limit: {len(_order_ts_window)} orders in last 60s — skipping")
+        return False
+    _order_ts_window.append(now)
+    return True
+
+
 def place_order(client: ClobClient, om: OrderManager,
                 token_id: str, limit: float, size_usdc: float,
                 fair: float, label: str) -> bool:
@@ -1031,6 +1063,9 @@ def place_order(client: ClobClient, om: OrderManager,
 
     if DRY_RUN:
         return True
+
+    if not _rate_limit_ok():
+        return False
 
     try:
         resp = client.create_and_post_order(
@@ -1175,6 +1210,10 @@ def process_market(client: ClobClient, om: OrderManager,
         if token_no:
             bid_no, ask_no, _, liquid_no = get_order_book(token_no)
         else:
+            bid_no, ask_no, liquid_no = 0.0, 1.0, False
+
+        # Guard the NO-side book the same way the YES side is guarded above
+        if not liquid_no or (ask_no - bid_no) > MAX_BOOK_SPREAD:
             bid_no, ask_no, liquid_no = 0.0, 1.0, False
 
         fair_no  = 1 - fair
@@ -1407,11 +1446,14 @@ def compute_hourly_fair(binance_sym: str, spot: float = 0.0, mins_left: float = 
     return fair_up, round(1 - fair_up, 4)
 
 
-MIN_HOURLY_VOLUME  = 10     # hourly markets are new each hour — volume is always tiny early
-MIN_HOURLY_MINS    = 15     # skip hourly markets with <15 min to expiry
-HOURLY_EDGE_BUFFER = 0.015  # tighter than regular 3% — hourly fairs cluster near 50¢
-MAX_HOURLY_SPREAD  = 0.30   # require a real two-sided book (skip 0.01/0.99 empty shells)
-MIN_HOURLY_BID     = 0.05   # require a real bid — avoids adverse selection in dead books
+MIN_HOURLY_VOLUME    = 10     # hourly markets are new each hour — volume is always tiny early
+MIN_HOURLY_MINS      = 15     # skip hourly markets with <15 min to expiry
+HOURLY_EDGE_BUFFER   = 0.015  # tighter than regular 3% — hourly fairs cluster near 50¢
+MAX_HOURLY_SPREAD    = 0.30   # require a real two-sided book (skip 0.01/0.99 empty shells)
+MIN_HOURLY_BID       = 0.05   # require a real bid — avoids adverse selection in dead books
+MIN_HOURLY_CONVICTION = 0.55  # require ≥55¢ fair before entering — no near-coinflip bets
+MIN_HOURLY_EDGE      = 0.03   # hourly markets need more edge than regular (noisier signal)
+MAX_HOURLY_BET_USDC  = 3.0    # cap hourly bets lower than regular $5 max
 
 
 def is_hourly_updown(question: str) -> bool:
@@ -1534,7 +1576,7 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -
 
         available = free_bankroll(bankroll, om)
 
-        if fair_up >= 0.50:
+        if fair_up >= MIN_HOURLY_CONVICTION:
             bid, ask, book_mid, liquid = get_order_book(token_up)
             if not liquid:
                 continue
@@ -1548,12 +1590,12 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -
             limit    = min(limit, ask - 0.01)
             net_edge = fair_up * (1 - TAKER_FEE) - limit
             label    = f"{asset} UP {time_str} ET (hourly)"
-            if net_edge >= MIN_EDGE and not om.has_open_order(token_up):
-                size = kelly_buy(fair_up, limit, available)
+            if net_edge >= MIN_HOURLY_EDGE and not om.has_open_order(token_up):
+                size = min(MAX_HOURLY_BET_USDC, kelly_buy(fair_up, limit, available))
                 if size >= MIN_BET_USDC:
                     if place_order(client, om, token_up, limit, size, fair_up, label):
                         orders_placed += 1
-        else:
+        elif fair_down >= MIN_HOURLY_CONVICTION:
             bid_dn, ask_dn, book_mid_dn, liquid_dn = get_order_book(token_down)
             if not liquid_dn:
                 continue
@@ -1567,13 +1609,88 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -
             limit    = min(limit, ask_dn - 0.01)
             net_edge = fair_down * (1 - TAKER_FEE) - limit
             label    = f"{asset} DOWN {time_str} ET (hourly)"
-            if net_edge >= MIN_EDGE and not om.has_open_order(token_down):
-                size = kelly_buy(fair_down, limit, available)
+            if net_edge >= MIN_HOURLY_EDGE and not om.has_open_order(token_down):
+                size = min(MAX_HOURLY_BET_USDC, kelly_buy(fair_down, limit, available))
                 if size >= MIN_BET_USDC:
                     if place_order(client, om, token_down, limit, size, fair_down, label):
                         orders_placed += 1
+        else:
+            log.debug(f"    Skip hourly {asset}: no conviction (fair_up={fair_up:.3f} fair_dn={fair_down:.3f})")
 
     return orders_placed
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# YES + NO STRUCTURAL ARBITRAGE
+# ══════════════════════════════════════════════════════════════════════════════
+# When YES ask + NO ask < (1 − fee) = 0.98, buying one share of each
+# guarantees a risk-free profit regardless of outcome.
+
+ARB_MIN_PROFIT  = 0.01   # require at least 1¢ profit after fee to enter
+ARB_MAX_BET     = 5.0    # max USDC spent on each leg of the arb pair
+
+
+def scan_yes_no_arb(client: ClobClient, om: OrderManager,
+                    markets: list[dict], bankroll: float) -> int:
+    """
+    Scan a list of Gamma markets for YES+NO structural arbitrage.
+    Places a BUY on both YES and NO tokens when combined ask price < 0.97.
+    Returns number of arb pairs entered.
+    """
+    placed = 0
+    for m in markets:
+        raw = m.get("clobTokenIds") or []
+        if isinstance(raw, str):
+            try: raw = json.loads(raw)
+            except: continue
+        if len(raw) < 2:
+            continue
+
+        token_yes, token_no = raw[0], raw[1]
+        if (om.already_holds(token_yes) or om.already_holds(token_no)
+                or om.has_open_order(token_yes) or om.has_open_order(token_no)):
+            continue
+        if float(m.get("volume") or 0) < MIN_VOLUME:
+            continue
+
+        try:
+            bid_y, ask_y, _, liq_y = get_order_book(token_yes)
+            bid_n, ask_n, _, liq_n = get_order_book(token_no)
+        except Exception:
+            continue
+
+        if not liq_y or not liq_n:
+            continue
+        if (ask_y - bid_y) > MAX_BOOK_SPREAD or (ask_n - bid_n) > MAX_BOOK_SPREAD:
+            continue
+
+        combined  = round(ask_y + ask_n, 4)
+        payout    = 1.0 - TAKER_FEE   # guaranteed payout per share (one side wins)
+        net_profit = round(payout - combined, 4)
+
+        if net_profit < ARB_MIN_PROFIT:
+            continue
+
+        available = free_bankroll(bankroll, om)
+        # Size: spend up to ARB_MAX_BET USDC on each leg, capped by available cash
+        size_yes = min(ARB_MAX_BET, available / 2)
+        size_no  = min(ARB_MAX_BET, available / 2)
+        if size_yes < MIN_BET_USDC or size_no < MIN_BET_USDC:
+            continue
+
+        label_base = m.get("question", "")[:40]
+        log.info(f"  ♻️  ARB: YES@{ask_y:.3f} + NO@{ask_n:.3f} = {combined:.3f} "
+                 f"(profit/share={net_profit:.3f})  {label_base}")
+
+        ok_y = place_order(client, om, token_yes, ask_y, size_yes, 1.0, f"ARB YES {label_base}")
+        ok_n = place_order(client, om, token_no,  ask_n, size_no,  1.0, f"ARB NO  {label_base}")
+        if ok_y and ok_n:
+            tg(f"♻️ <b>ARB PAIR</b>\n"
+               f"YES@{ask_y:.3f} + NO@{ask_n:.3f} = {combined:.3f}\n"
+               f"Profit/share: {net_profit:.3f}  ({label_base})")
+            placed += 1
+
+    return placed
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1608,7 +1725,7 @@ def get_positions_value(wallet: str) -> float:
 class PnL:
     def __init__(self, wallet: str = ""):
         self.start          = datetime.now(timezone.utc)
-        self.last_report    = time.time()
+        self.last_report    = 0.0  # 0 ensures the first 9am window always fires
         self.wallet         = wallet
         # Baselines snapshotted at startup / each report
         self.last_portfolio = 0.0
@@ -1621,8 +1738,12 @@ class PnL:
         log.info(f"  P&L baseline: ${self.last_portfolio:.2f} (cash + positions)")
 
     def maybe_report(self, om: OrderManager, bankroll: float) -> None:
-        if time.time() - self.last_report < PNL_REPORT_HOURS * 3600:
+        now_utc = datetime.now(timezone.utc)
+        # Fire once per day at 9:00–9:05am UTC
+        if now_utc.hour != 9 or now_utc.minute > 5:
             return
+        if time.time() - self.last_report < 3600:
+            return  # already reported within this 9am window
 
         uptime    = str(datetime.now(timezone.utc) - self.start).split(".")[0]
         pos_value = get_positions_value(self.wallet)
@@ -1712,7 +1833,8 @@ def run_loop(client: ClobClient, wallet: str) -> None:
             bankroll = get_usdc_balance(client, wallet)
 
         current_fairs: dict[str, float] = {}
-        cycle_orders = 0
+        cycle_orders  = 0
+        all_markets:  list[dict] = []   # accumulated for arb scan (no re-fetch)
 
         for asset, cfg in ASSETS.items():
             spot = get_price(cfg["coingecko_id"], cfg["binance_symbol"])
@@ -1723,6 +1845,7 @@ def run_loop(client: ClobClient, wallet: str) -> None:
             log.info(f"\n{'─'*24} {asset} ${spot:,.2f} {'─'*24}")
             drift   = get_live_drift(cfg["binance_symbol"], cfg["drift"])
             markets = collect_markets(asset, cfg)
+            all_markets.extend(markets)
             log.info(f"  {len(markets)} {asset} markets")
 
             results = []
@@ -1759,6 +1882,16 @@ def run_loop(client: ClobClient, wallet: str) -> None:
             else:
                 log.info(f"  [{asset}] No priceable markets (drift={drift*100:.0f}%)")
 
+        # ── YES+NO structural arbitrage scan ─────────────────────────────────
+        log.info(f"\n{'─'*24} ARB SCAN {'─'*24}")
+        try:
+            arb_placed = scan_yes_no_arb(client, om, all_markets, bankroll)
+            cycle_orders += arb_placed
+            if arb_placed == 0:
+                log.info("  No arb opportunities this cycle.")
+        except Exception as e:
+            log.debug(f"  Arb scan error: {e}")
+
         # ── Hourly up/down markets (momentum-based, no strike) ────────────────
         log.info(f"\n{'─'*24} HOURLY MARKETS {'─'*24}")
         try:
@@ -1766,13 +1899,17 @@ def run_loop(client: ClobClient, wallet: str) -> None:
             cycle_orders += hourly_placed
             if hourly_placed == 0:
                 log.info("  No hourly edge this cycle.")
-            # Register hourly fairs so stale hourly orders get cancelled too
+            # Register hourly fairs so stale hourly orders get cancelled too.
+            # Only fill in tokens NOT already written by scan_hourly_markets —
+            # that call uses the correct blended (option-weighted) fair; calling
+            # compute_hourly_fair() without spot/mins_left here would overwrite
+            # with a momentum-only fair and incorrectly cancel near-expiry orders.
             for m, asset, bsym in _collect_hourly_markets():
                 raw = m.get("clobTokenIds") or []
                 if isinstance(raw, str):
                     try: raw = json.loads(raw)
                     except: raw = []
-                if len(raw) >= 2:
+                if len(raw) >= 2 and raw[0] not in current_fairs:
                     fu, fd = compute_hourly_fair(bsym)
                     current_fairs[raw[0]] = fu
                     current_fairs[raw[1]] = fd
