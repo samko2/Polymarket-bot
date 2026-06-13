@@ -16,6 +16,7 @@ import math
 import time
 import json
 import logging
+from collections import defaultdict, deque
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field
 
@@ -77,6 +78,14 @@ MAX_BOOK_SPREAD       = 0.25    # require a real two-sided book on regular marke
 POSITION_SYNC_MINS    = 10      # re-sync held positions from Data API every N minutes
 MAX_POSITION_TOKENS   = 50      # max distinct token positions held at once
 MANUAL_BANKROLL       = float(os.getenv("MANUAL_BANKROLL", "0"))  # override balance check if set
+
+# ── Drawdown protection ────────────────────────────────────────────────────────
+DRAWDOWN_WARN_PCT  = 0.20   # 20% from peak → halve Kelly + Telegram alert
+DRAWDOWN_PAUSE_PCT = 0.30   # 30% from peak → halt trading entirely
+
+# ── Rolling win-rate (dynamic Kelly) ──────────────────────────────────────────
+WINRATE_WINDOW     = 20     # look back over the last N resolved positions
+WINRATE_MIN_SAMPLE = 5      # need at least this many before adjusting Kelly
 
 # ── Telegram ───────────────────────────────────────────────────────────────────
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
@@ -313,6 +322,7 @@ class OrderManager:
         self.open_token_ids:  set[str] = set()
         # token_id → avg entry price (0.0 = unknown, exit logic skips those)
         self.held_positions:  dict[str, float] = dict(existing_positions or {})
+        self.held_labels:     dict[str, str]   = {}   # token_id → market label for win-rate tracking
         self.recent_fill_ts:  dict[str, float] = {}   # token_id → fill time
         self.fills_usdc:      float = 0.0
         self.fill_count:      int   = 0
@@ -391,6 +401,7 @@ class OrderManager:
                         self.fills_usdc += filled_usdc
                         self.fill_count += 1
                         self.held_positions[tracked.token_id] = fill_price  # true entry price
+                        self.held_labels[tracked.token_id]   = tracked.label
                         self.recent_fill_ts[tracked.token_id] = time.time()
                         fill_events.append({
                             "label":        tracked.label,
@@ -529,10 +540,13 @@ def scan_exit_positions(client: ClobClient, om: OrderManager, wallet: str = "") 
             )
             if resp and resp.get("success"):
                 log.info(f"    ✓ Exit order placed: {resp.get('orderID','')[:20]}")
+                label = om.held_labels.get(token_id, "")
                 tg(f"🔴 <b>EXIT</b> {reason}\n"
                    f"{shares:.2f}sh  entry={entry:.3f} → sell@{sell_price:.3f}\n"
-                   f"token={token_id[:16]}…")
+                   f"{label or token_id[:16]}")
+                _wr_tracker.record_exit(label, won=(gain >= 0))
                 om.held_positions.pop(token_id, None)
+                om.held_labels.pop(token_id, None)
                 _pos_size_cache.pop(token_id, None)
             else:
                 log.warning(f"    ✗ Exit rejected: {resp}")
@@ -885,6 +899,118 @@ def parse_question(q: str, spot: float, end_date: datetime) -> list:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# DRAWDOWN GUARD
+# ══════════════════════════════════════════════════════════════════════════════
+
+class DrawdownGuard:
+    """Tracks peak bankroll and reduces / halts trading during drawdown."""
+
+    def __init__(self):
+        self.peak   = 0.0
+        self._state = "ok"   # "ok" | "warn" | "pause"
+
+    def update(self, bankroll: float) -> None:
+        if bankroll > self.peak:
+            if self._state != "ok":
+                log.info(f"  ✅ Drawdown guard: recovered to ${bankroll:.2f} "
+                         f"(was {self._state}, peak=${self.peak:.2f})")
+                tg(f"✅ <b>Drawdown recovered</b>\nBankroll: ${bankroll:.2f}")
+            self.peak   = bankroll
+            self._state = "ok"
+
+    def kelly_multiplier(self, bankroll: float) -> float:
+        if self.peak <= 0:
+            return 1.0
+        dd = (self.peak - bankroll) / self.peak
+        if dd >= DRAWDOWN_PAUSE_PCT:
+            if self._state != "pause":
+                self._state = "pause"
+                log.warning(f"  🚨 DRAWDOWN PAUSE: {dd*100:.0f}% below peak "
+                            f"${self.peak:.2f} → trading halted")
+                tg(f"🚨 <b>DRAWDOWN PAUSE</b> ({dd*100:.0f}% from peak)\n"
+                   f"Bankroll ${bankroll:.2f} vs peak ${self.peak:.2f}\n"
+                   f"Trading halted until bankroll recovers above "
+                   f"${self.peak * (1 - DRAWDOWN_WARN_PCT):.2f}")
+            return 0.0
+        if dd >= DRAWDOWN_WARN_PCT:
+            if self._state == "ok":
+                self._state = "warn"
+                log.warning(f"  ⚠️ DRAWDOWN WARNING: {dd*100:.0f}% below peak "
+                            f"${self.peak:.2f} → Kelly halved")
+                tg(f"⚠️ <b>Drawdown warning</b> ({dd*100:.0f}% from peak)\n"
+                   f"Bankroll ${bankroll:.2f} vs peak ${self.peak:.2f}\n"
+                   f"Bet sizing halved until recovery")
+            return 0.5
+        return 1.0
+
+    @property
+    def is_paused(self) -> bool:
+        return self._state == "pause"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# WIN-RATE TRACKER  (per market type, rolling window)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class WinRateTracker:
+    """Records exit outcomes and adjusts Kelly fraction based on recent performance."""
+
+    def __init__(self):
+        self._history: dict[str, deque] = defaultdict(lambda: deque(maxlen=WINRATE_WINDOW))
+
+    @staticmethod
+    def _market_type(label: str) -> str:
+        lbl = (label or "").lower()
+        if "hourly" in lbl or " et " in lbl:
+            return "hourly"
+        if "arb" in lbl:
+            return "arb"
+        return "daily"
+
+    def record_exit(self, label: str, won: bool) -> None:
+        mtype = self._market_type(label)
+        self._history[mtype].append(won)
+        self._history["all"].append(won)
+        wr = self.win_rate("all")
+        log.info(f"  📊 Win-rate update [{mtype}] {'WIN' if won else 'LOSS'} — "
+                 f"all:{wr*100:.0f}% over {len(self._history['all'])} trades"
+                 if wr is not None else f"  📊 Exit recorded [{mtype}]")
+
+    def win_rate(self, mtype: str = "all") -> float | None:
+        h = self._history[mtype]
+        return sum(h) / len(h) if len(h) >= WINRATE_MIN_SAMPLE else None
+
+    def kelly_multiplier(self) -> float:
+        wr = self.win_rate("all")
+        if wr is None:
+            return 1.0   # not enough data — don't penalise yet
+        if wr >= 0.60:
+            return 1.0   # performing well — full Kelly
+        if wr >= 0.50:
+            return 0.75  # slight underperformance
+        if wr >= 0.40:
+            return 0.50  # clearly underperforming — half Kelly
+        return 0.25      # poor run — near-minimum sizing
+
+    def summary(self) -> str:
+        parts = []
+        for mtype in ("hourly", "daily", "arb"):
+            h = self._history[mtype]
+            if h:
+                wr = sum(h) / len(h)
+                parts.append(f"{mtype}:{wr*100:.0f}%({len(h)})")
+        wr_all = self.win_rate()
+        prefix = f"all:{wr_all*100:.0f}% | " if wr_all is not None else ""
+        return prefix + " | ".join(parts) if (prefix or parts) else "no data yet"
+
+
+_dd_guard   = DrawdownGuard()
+_wr_tracker = WinRateTracker()
+# Updated at the start of each cycle; all kelly_buy calls use this value.
+_effective_kelly = KELLY_FRACTION
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # KELLY SIZING
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -892,7 +1018,7 @@ def kelly_buy(fair: float, limit: float, bankroll: float) -> float:
     if limit <= 0 or limit >= 1 or fair * (1 - TAKER_FEE) <= limit:
         return 0.0
     f_star = (fair * (1 - TAKER_FEE) - limit) / (1 - limit)
-    return round(min(MAX_BET_USDC, max(0.0, KELLY_FRACTION * f_star * bankroll)), 2)
+    return round(min(MAX_BET_USDC, max(0.0, _effective_kelly * f_star * bankroll)), 2)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1757,14 +1883,19 @@ class PnL:
         log.info(f"[24h] uptime={uptime} {om.summary()} "
                  f"portfolio=${portfolio:.2f} ({change:+.2f})")
 
+        dd_pct = (((_dd_guard.peak - portfolio) / _dd_guard.peak * 100)
+                  if _dd_guard.peak > 0 else 0.0)
         tg(f"{emoji} <b>DAILY P&L REPORT</b>\n"
            f"━━━━━━━━━━━━━━━━━\n"
            f"Portfolio: <b>${portfolio:.2f}</b>  ({change:+.2f} / {pct:+.1f}%)\n"
            f"Cash: ${bankroll:.2f}  ·  Positions: ${pos_value:.2f}\n"
+           f"Peak: ${_dd_guard.peak:.2f}  ({dd_pct:+.1f}% from peak)\n"
            f"━━━━━━━━━━━━━━━━━\n"
            f"24h orders: {orders}  ·  24h fills: {fills}\n"
            f"Open positions: {len(om.held_positions)}\n"
            f"Committed to open orders: ${om.committed_usdc():.2f}\n"
+           f"Win-rate: {_wr_tracker.summary()}\n"
+           f"Kelly: {_effective_kelly:.4f} (base {KELLY_FRACTION})\n"
            f"Uptime: {uptime}")
 
         self.last_portfolio = portfolio
@@ -1812,6 +1943,22 @@ def run_loop(client: ClobClient, wallet: str) -> None:
             elif not DRY_RUN:
                 bankroll = get_usdc_balance(client, wallet)
             last_reset = cycle_start
+
+        # ── Drawdown guard + dynamic Kelly ────────────────────────────────────
+        global _effective_kelly
+        _dd_guard.update(bankroll)
+        dd_mult = _dd_guard.kelly_multiplier(bankroll)
+        wr_mult = _wr_tracker.kelly_multiplier()
+        _effective_kelly = round(KELLY_FRACTION * dd_mult * wr_mult, 4)
+        if _dd_guard.is_paused:
+            log.warning(f"  🚨 Trading paused (drawdown). "
+                        f"Bankroll ${bankroll:.2f} / peak ${_dd_guard.peak:.2f}. "
+                        f"Win-rate: {_wr_tracker.summary()}")
+            time.sleep(POLL_INTERVAL)
+            continue
+        if _effective_kelly < KELLY_FRACTION:
+            log.info(f"  Kelly reduced: {_effective_kelly:.4f} "
+                     f"(dd×{dd_mult:.2f} wr×{wr_mult:.2f})")
 
         # ── Check for fills ────────────────────────────────────────────────────
         fills = om.refresh_from_api(client)
