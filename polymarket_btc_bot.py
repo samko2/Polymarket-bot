@@ -87,6 +87,15 @@ DRAWDOWN_PAUSE_PCT = 0.30   # 30% from peak → halt trading entirely
 WINRATE_WINDOW     = 20     # look back over the last N resolved positions
 WINRATE_MIN_SAMPLE = 5      # need at least this many before adjusting Kelly
 
+# ── Exit tuning ────────────────────────────────────────────────────────────────
+TAKE_PROFIT_2       = 0.70  # second half of partial TP exits at +70%
+TRAIL_STOP_TRIGGER  = 0.25  # start trailing once position is up ≥25%
+TRAIL_STOP_DROP     = 0.15  # exit if bid drops 15% below its peak while trailing
+LOSS_COOLDOWN_HOURS = 1.5   # block same asset+direction for 1.5h after a stop-loss
+
+# ── Order hygiene ──────────────────────────────────────────────────────────────
+MAX_ORDER_AGE_HOURS = 3.0   # cancel unfilled GTC orders older than this
+
 # ── Telegram ───────────────────────────────────────────────────────────────────
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -324,6 +333,8 @@ class OrderManager:
         self.held_positions:  dict[str, float] = dict(existing_positions or {})
         self.held_labels:     dict[str, str]   = {}   # token_id → market label for win-rate tracking
         self.recent_fill_ts:  dict[str, float] = {}   # token_id → fill time
+        self.peak_bid:        dict[str, float] = {}   # token_id → highest bid seen (trailing stop)
+        self.partial_exit_done: set[str]       = set()  # tokens where first half already sold
         self.fills_usdc:      float = 0.0
         self.fill_count:      int   = 0
         self.order_count:     int   = 0
@@ -436,6 +447,22 @@ class OrderManager:
                 except Exception as e:
                     log.warning(f"  Cancel {oid[:10]} failed: {e}")
 
+    def cancel_aged(self, client: ClobClient) -> None:
+        """Cancel unfilled GTC orders older than MAX_ORDER_AGE_HOURS."""
+        if DRY_RUN:
+            return
+        cutoff = time.time() - MAX_ORDER_AGE_HOURS * 3600
+        for oid, tracked in list(self.orders.items()):
+            if tracked.placed_at < cutoff:
+                age_h = (time.time() - tracked.placed_at) / 3600
+                log.info(f"  Cancelling aged order {oid[:10]} ({age_h:.1f}h old): {tracked.label[:30]}")
+                try:
+                    client.cancel_order(OrderPayload(orderID=oid))
+                    self.orders.pop(oid, None)
+                    self.open_token_ids.discard(tracked.token_id)
+                except Exception as e:
+                    log.warning(f"  Cancel aged {oid[:10]} failed: {e}")
+
     def cancel_all(self, client: ClobClient) -> None:
         if DRY_RUN:
             return
@@ -492,43 +519,86 @@ def _get_position_size(wallet: str, token_id: str) -> float:
 
 def scan_exit_positions(client: ClobClient, om: OrderManager, wallet: str = "") -> None:
     """
-    Check all held positions against current bid price.
-    Sell if up ≥ TAKE_PROFIT or down ≥ STOP_LOSS from entry.
-    Entry price of 0.0 means we don't know it (startup load) — skip those.
-    Queries actual position size so the full holding is sold, not just 5 shares.
+    Exit logic with four tiers:
+    - Trailing stop: if position ever gains ≥25%, sell when bid retreats 15% from peak
+    - Partial TP:    sell half at +40% (hourly only, if ≥10 shares); let rest ride
+    - Final TP:      sell remaining half at +70%
+    - Stop-loss:     sell full position at -40% (-24% for second half)
+    Records loss cooldowns so the same direction isn't re-entered for 1.5h.
     """
     if DRY_RUN:
         return
     for token_id, entry in list(om.held_positions.items()):
         if entry <= 0:
-            continue  # unknown entry — can't evaluate exit
+            continue
         if time.time() - om.recent_fill_ts.get(token_id, 0) < 900:
-            continue  # held <15 min — entry price may not be settled yet
+            continue  # held <15 min — entry price may not be settled
         try:
             bid, ask, _, liquid = get_order_book(token_id)
             if not liquid or bid < 0.05:
-                continue  # no real bid / dust position — not worth selling
+                continue
             if (ask - bid) > 0.30:
-                continue  # one-sided book — bid is unreliable, don't exit into it
-
-            gain = (bid - entry) / entry
-            if gain >= TAKE_PROFIT:
-                reason = f"take-profit (+{gain*100:.0f}%)"
-            elif gain <= -STOP_LOSS:
-                reason = f"stop-loss ({gain*100:.0f}%)"
-            else:
                 continue
 
-            # Query actual share count so we sell the full position
+            # ── Track peak bid for trailing stop ──────────────────────────
+            current_peak = max(bid, om.peak_bid.get(token_id, entry))
+            om.peak_bid[token_id] = current_peak
+
+            gain      = (bid - entry) / entry
+            peak_gain = (current_peak - entry) / entry
+            label     = om.held_labels.get(token_id, "")
+            is_hourly = "hourly" in label.lower() or " et " in label.lower()
+            is_partial = token_id in om.partial_exit_done
+
+            reason   = None
+            sell_all = True
+
+            if not is_partial:
+                # ── Trailing stop (kicks in after 25% gain, hourly only) ──
+                if is_hourly and peak_gain >= TRAIL_STOP_TRIGGER:
+                    if bid <= current_peak * (1 - TRAIL_STOP_DROP):
+                        reason = (f"trailing-stop "
+                                  f"(peak={current_peak:.3f} → bid={bid:.3f})")
+                # ── Partial TP at +40% (hourly, ≥10 shares) ──────────────
+                if reason is None and gain >= TAKE_PROFIT:
+                    if is_hourly:
+                        reason   = f"partial take-profit (+{gain*100:.0f}%)"
+                        sell_all = False   # sell half, leave the rest
+                    else:
+                        reason = f"take-profit (+{gain*100:.0f}%)"
+                # ── Standard stop-loss ────────────────────────────────────
+                if reason is None and gain <= -STOP_LOSS:
+                    reason = f"stop-loss ({gain*100:.0f}%)"
+            else:
+                # Second half: trailing stop or higher TP or tighter SL
+                if is_hourly and peak_gain >= TRAIL_STOP_TRIGGER:
+                    if bid <= current_peak * (1 - TRAIL_STOP_DROP):
+                        reason = (f"final trailing-stop "
+                                  f"(peak={current_peak:.3f} → bid={bid:.3f})")
+                if reason is None and gain >= TAKE_PROFIT_2:
+                    reason = f"final take-profit (+{gain*100:.0f}%)"
+                if reason is None and gain <= -(STOP_LOSS * 0.60):
+                    reason = f"final stop-loss ({gain*100:.0f}%)"
+
+            if reason is None:
+                continue
+
+            # ── Determine shares to sell ───────────────────────────────────
             shares = round(_get_position_size(wallet, token_id), 2)
             if shares < 5.0:
-                # CLOB minimum is 5 shares — can't exit a sub-5-share position;
-                # inflating the size would oversell beyond what we actually hold
-                log.info(f"  Skip exit {token_id[:12]}…: position too small "
+                log.info(f"  Skip exit {token_id[:12]}…: too small "
                          f"({shares:.2f}sh < 5 CLOB minimum)")
                 continue
 
-            # Floor to 1¢ tick — and cap at 0.99 (1.00 is not a valid price)
+            if not sell_all:
+                half = math.floor(shares / 2)
+                # If we can't leave ≥5 shares behind, just sell everything
+                if half < 5 or (shares - half) < 5:
+                    sell_all = True
+                    reason   = reason.replace("partial ", "")
+                else:
+                    shares = float(half)
+
             sell_price = min(0.99, max(0.01, math.floor(bid * 100) / 100))
             log.info(f"  🔴 EXIT {token_id[:12]}… entry={entry:.3f} bid={bid:.3f} "
                      f"shares={shares:.2f} → {reason}")
@@ -540,14 +610,27 @@ def scan_exit_positions(client: ClobClient, om: OrderManager, wallet: str = "") 
             )
             if resp and resp.get("success"):
                 log.info(f"    ✓ Exit order placed: {resp.get('orderID','')[:20]}")
-                label = om.held_labels.get(token_id, "")
                 tg(f"🔴 <b>EXIT</b> {reason}\n"
                    f"{shares:.2f}sh  entry={entry:.3f} → sell@{sell_price:.3f}\n"
                    f"{label or token_id[:16]}")
                 _wr_tracker.record_exit(label, won=(gain >= 0))
-                om.held_positions.pop(token_id, None)
-                om.held_labels.pop(token_id, None)
-                _pos_size_cache.pop(token_id, None)
+                if sell_all:
+                    om.held_positions.pop(token_id, None)
+                    om.held_labels.pop(token_id, None)
+                    om.peak_bid.pop(token_id, None)
+                    om.partial_exit_done.discard(token_id)
+                    _pos_size_cache.pop(token_id, None)
+                    if "stop-loss" in reason:
+                        ck = _cooldown_key(label)
+                        if ck:
+                            _loss_cooldown[ck] = time.time()
+                            log.info(f"  Loss cooldown set: {ck} for "
+                                     f"{LOSS_COOLDOWN_HOURS}h")
+                            tg(f"⏳ Loss cooldown: <b>{ck}</b> blocked for "
+                               f"{LOSS_COOLDOWN_HOURS}h")
+                else:
+                    om.partial_exit_done.add(token_id)
+                    _pos_size_cache.pop(token_id, None)
             else:
                 log.warning(f"    ✗ Exit rejected: {resp}")
         except Exception as e:
@@ -1008,6 +1091,21 @@ _dd_guard   = DrawdownGuard()
 _wr_tracker = WinRateTracker()
 # Updated at the start of each cycle; all kelly_buy calls use this value.
 _effective_kelly = KELLY_FRACTION
+
+# Loss cooldown: maps "BTC_UP" / "ETH_DOWN" etc. → timestamp of last stop-loss
+_loss_cooldown: dict[str, float] = {}
+
+
+def _cooldown_key(label: str) -> str | None:
+    """Extract 'ASSET_DIR' key from a label like 'BTC UP 2pm ET (hourly)'."""
+    u = label.upper()
+    for asset in ("BTC", "ETH", "SOL"):
+        if asset in u:
+            if " UP " in u or u.endswith("UP") or "(HOURLY)" in u and "UP" in u:
+                return f"{asset}_UP"
+            if " DOWN " in u or u.endswith("DOWN"):
+                return f"{asset}_DOWN"
+    return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1687,6 +1785,17 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -
         if len(om.held_token_ids) >= MAX_POSITION_TOKENS:
             continue
 
+        # ── Correlation limit: max 1 active hourly position per asset ──────
+        if any(asset in lbl and ("hourly" in lbl.lower() or " et " in lbl.lower())
+               for lbl in om.held_labels.values()):
+            log.debug(f"    Skip {asset} hourly: already holding a {asset} hourly position")
+            continue
+
+        # ── Loss cooldown: skip direction for 1.5h after a stop-loss ───────
+        now_ts    = time.time()
+        up_on_cd  = now_ts - _loss_cooldown.get(f"{asset}_UP",   0) < LOSS_COOLDOWN_HOURS * 3600
+        dn_on_cd  = now_ts - _loss_cooldown.get(f"{asset}_DOWN", 0) < LOSS_COOLDOWN_HOURS * 3600
+
         # ── Fetch spot (cached per asset) ─────────────────────────────────
         if asset not in spot_map:
             acfg = ASSETS.get(asset, {})
@@ -1703,43 +1812,47 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -
         available = free_bankroll(bankroll, om)
 
         if fair_up >= MIN_HOURLY_CONVICTION:
-            bid, ask, book_mid, liquid = get_order_book(token_up)
-            if not liquid:
-                continue
-            if (ask - bid) > MAX_HOURLY_SPREAD or bid < MIN_HOURLY_BID:
-                log.debug(f"    Skip hourly UP: dead book bid={bid:.2f} ask={ask:.2f}")
-                continue
-            if abs(fair_up - book_mid) > MAX_MODEL_MARKET_GAP:
-                log.debug(f"    Skip hourly UP: model={fair_up:.2f} book={book_mid:.2f}")
-                continue
-            limit    = round(max(bid + 0.01, fair_up - HOURLY_EDGE_BUFFER, 0.02), 2)
-            limit    = min(limit, ask - 0.01)
-            net_edge = fair_up * (1 - TAKER_FEE) - limit
-            label    = f"{asset} UP {time_str} ET (hourly)"
-            if net_edge >= MIN_HOURLY_EDGE and not om.has_open_order(token_up):
-                size = min(MAX_HOURLY_BET_USDC, kelly_buy(fair_up, limit, available))
-                if size >= MIN_BET_USDC:
-                    if place_order(client, om, token_up, limit, size, fair_up, label):
-                        orders_placed += 1
+            if up_on_cd:
+                log.info(f"    Skip {asset} UP: loss cooldown active")
+            else:
+                bid, ask, book_mid, liquid = get_order_book(token_up)
+                if not liquid:
+                    pass
+                elif (ask - bid) > MAX_HOURLY_SPREAD or bid < MIN_HOURLY_BID:
+                    log.debug(f"    Skip hourly UP: dead book bid={bid:.2f} ask={ask:.2f}")
+                elif abs(fair_up - book_mid) > MAX_MODEL_MARKET_GAP:
+                    log.debug(f"    Skip hourly UP: model={fair_up:.2f} book={book_mid:.2f}")
+                else:
+                    limit    = round(max(bid + 0.01, fair_up - HOURLY_EDGE_BUFFER, 0.02), 2)
+                    limit    = min(limit, ask - 0.01)
+                    net_edge = fair_up * (1 - TAKER_FEE) - limit
+                    label    = f"{asset} UP {time_str} ET (hourly)"
+                    if net_edge >= MIN_HOURLY_EDGE and not om.has_open_order(token_up):
+                        size = min(MAX_HOURLY_BET_USDC, kelly_buy(fair_up, limit, available))
+                        if size >= MIN_BET_USDC:
+                            if place_order(client, om, token_up, limit, size, fair_up, label):
+                                orders_placed += 1
         elif fair_down >= MIN_HOURLY_CONVICTION:
-            bid_dn, ask_dn, book_mid_dn, liquid_dn = get_order_book(token_down)
-            if not liquid_dn:
-                continue
-            if (ask_dn - bid_dn) > MAX_HOURLY_SPREAD or bid_dn < MIN_HOURLY_BID:
-                log.debug(f"    Skip hourly DOWN: dead book bid={bid_dn:.2f} ask={ask_dn:.2f}")
-                continue
-            if abs(fair_down - book_mid_dn) > MAX_MODEL_MARKET_GAP:
-                log.debug(f"    Skip hourly DOWN: model={fair_down:.2f} book={book_mid_dn:.2f}")
-                continue
-            limit    = round(max(bid_dn + 0.01, fair_down - HOURLY_EDGE_BUFFER, 0.02), 2)
-            limit    = min(limit, ask_dn - 0.01)
-            net_edge = fair_down * (1 - TAKER_FEE) - limit
-            label    = f"{asset} DOWN {time_str} ET (hourly)"
-            if net_edge >= MIN_HOURLY_EDGE and not om.has_open_order(token_down):
-                size = min(MAX_HOURLY_BET_USDC, kelly_buy(fair_down, limit, available))
-                if size >= MIN_BET_USDC:
-                    if place_order(client, om, token_down, limit, size, fair_down, label):
-                        orders_placed += 1
+            if dn_on_cd:
+                log.info(f"    Skip {asset} DOWN: loss cooldown active")
+            else:
+                bid_dn, ask_dn, book_mid_dn, liquid_dn = get_order_book(token_down)
+                if not liquid_dn:
+                    pass
+                elif (ask_dn - bid_dn) > MAX_HOURLY_SPREAD or bid_dn < MIN_HOURLY_BID:
+                    log.debug(f"    Skip hourly DOWN: dead book bid={bid_dn:.2f} ask={ask_dn:.2f}")
+                elif abs(fair_down - book_mid_dn) > MAX_MODEL_MARKET_GAP:
+                    log.debug(f"    Skip hourly DOWN: model={fair_down:.2f} book={book_mid_dn:.2f}")
+                else:
+                    limit    = round(max(bid_dn + 0.01, fair_down - HOURLY_EDGE_BUFFER, 0.02), 2)
+                    limit    = min(limit, ask_dn - 0.01)
+                    net_edge = fair_down * (1 - TAKER_FEE) - limit
+                    label    = f"{asset} DOWN {time_str} ET (hourly)"
+                    if net_edge >= MIN_HOURLY_EDGE and not om.has_open_order(token_down):
+                        size = min(MAX_HOURLY_BET_USDC, kelly_buy(fair_down, limit, available))
+                        if size >= MIN_BET_USDC:
+                            if place_order(client, om, token_down, limit, size, fair_down, label):
+                                orders_placed += 1
         else:
             log.debug(f"    Skip hourly {asset}: no conviction (fair_up={fair_up:.3f} fair_dn={fair_down:.3f})")
 
@@ -1967,6 +2080,9 @@ def run_loop(client: ClobClient, wallet: str) -> None:
                f"{f['size_matched']:.2f}sh @ {f['limit']:.3f} = ${f['filled_usdc']:.2f}\n"
                f"Fair: {f['fair']:.3f}  Edge: {f['edge_at_fill']:+.3f}")
 
+        # ── Cancel GTC orders older than MAX_ORDER_AGE_HOURS ─────────────────
+        om.cancel_aged(client)
+
         # ── Re-sync positions from API so memory matches reality ───────────────
         if cycle_start - last_pos_sync > POSITION_SYNC_MINS * 60:
             om.sync_positions(wallet)
@@ -2123,6 +2239,8 @@ def run() -> None:
             break
         except Exception as e:
             log.error(f"Crash: {e} — restarting in {restart_delay}s…")
+            tg(f"⚠️ <b>Bot crashed — restarting in {restart_delay}s</b>\n"
+               f"<code>{str(e)[:300]}</code>")
             time.sleep(restart_delay)
             restart_delay = min(restart_delay * 2, 300)  # cap at 5 min
         else:
