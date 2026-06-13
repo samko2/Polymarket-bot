@@ -158,6 +158,26 @@ ASSETS = {
         ],
         "end_date": datetime(2026, 12, 31, 23, 59, tzinfo=timezone.utc),
     },
+    "XRP": {
+        "vol":            0.75,
+        "drift":          0.10,
+        "binance_symbol": "XRP",
+        "coingecko_id":   "ripple",
+        "keywords":       ["xrp", "ripple"],
+        "daily_names":    ["xrp", "ripple"],
+        "slugs":          [],   # no long-term price target markets
+        "end_date": datetime(2026, 12, 31, 23, 59, tzinfo=timezone.utc),
+    },
+    "HYPE": {
+        "vol":            1.20,
+        "drift":          0.30,
+        "binance_symbol": "HYPE",
+        "coingecko_id":   "hyperliquid",
+        "keywords":       ["hyperliquid"],
+        "daily_names":    ["hyperliquid", "hype"],
+        "slugs":          [],   # no long-term price target markets
+        "end_date": datetime(2026, 12, 31, 23, 59, tzinfo=timezone.utc),
+    },
 }
 
 # ── Caches ─────────────────────────────────────────────────────────────────────
@@ -1100,7 +1120,7 @@ _loss_cooldown: dict[str, float] = {}
 def _cooldown_key(label: str) -> str | None:
     """Extract 'ASSET_DIR' key from a label like 'BTC UP 2pm ET (hourly)'."""
     u = label.upper()
-    for asset in ("BTC", "ETH", "SOL"):
+    for asset in ("BTC", "ETH", "SOL", "XRP", "HYPE"):
         if asset in u:
             if " UP " in u or u.endswith("UP") or "(HOURLY)" in u and "UP" in u:
                 return f"{asset}_UP"
@@ -1462,9 +1482,11 @@ def process_market(client: ClobClient, om: OrderManager,
 
 # Each entry: slug_name used in Polymarket URLs, Binance base symbol
 HOURLY_ASSETS = {
-    "BTC": {"slug_name": "bitcoin",  "binance": "BTC"},
-    "ETH": {"slug_name": "ethereum", "binance": "ETH"},
-    "SOL": {"slug_name": "solana",   "binance": "SOL"},
+    "BTC":  {"slug_name": "bitcoin",      "binance": "BTC"},
+    "ETH":  {"slug_name": "ethereum",     "binance": "ETH"},
+    "SOL":  {"slug_name": "solana",       "binance": "SOL"},
+    "XRP":  {"slug_name": "xrp",          "binance": "XRP"},
+    "HYPE": {"slug_name": "hyperliquid",  "binance": "HYPE"},
 }
 
 
@@ -1641,9 +1663,11 @@ _BEARISH_WORDS = frozenset([
     "liquidat", "bankrupt", "attack", "stolen", "vulnerab",
 ])
 _ASSET_NEWS_KEYWORDS = {
-    "BTC": ["bitcoin"],
-    "ETH": ["ethereum"],
-    "SOL": ["solana"],
+    "BTC":  ["bitcoin"],
+    "ETH":  ["ethereum"],
+    "SOL":  ["solana"],
+    "XRP":  ["xrp", "ripple"],
+    "HYPE": ["hyperliquid"],
 }
 _RSS_FEEDS = [
     "https://cointelegraph.com/rss",
@@ -1846,9 +1870,11 @@ def _collect_hourly_markets() -> list[tuple[dict, str, str]]:
 
     # ── Gamma keyword fallback ─────────────────────────────────────────────
     if not results:
-        kw_map = [("bitcoin up or down", "BTC", "BTC"),
-                  ("ethereum up or down", "ETH", "ETH"),
-                  ("solana up or down",   "SOL", "SOL")]
+        kw_map = [("bitcoin up or down",     "BTC",  "BTC"),
+                  ("ethereum up or down",    "ETH",  "ETH"),
+                  ("solana up or down",      "SOL",  "SOL"),
+                  ("xrp up or down",         "XRP",  "XRP"),
+                  ("hyperliquid up or down", "HYPE", "HYPE")]
         for kw, asset, bsym in kw_map:
             try:
                 for m in search_gamma(kw, limit=20):
@@ -1861,7 +1887,7 @@ def _collect_hourly_markets() -> list[tuple[dict, str, str]]:
 
 def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -> int:
     """
-    Scan current + next-2-hour up/down markets for BTC, ETH, SOL.
+    Scan current + next-2-hour up/down markets for BTC, ETH, SOL, XRP, HYPE.
     Returns number of orders placed.
     """
     orders_placed = 0
