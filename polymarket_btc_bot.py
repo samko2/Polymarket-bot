@@ -1611,6 +1611,20 @@ def _hourly_momentum(binance_sym: str) -> float:
             val *= max(0.0, (100.0 - rsi_val) / 30.0)
         elif rsi_val < 30 and val < 0:
             val *= max(0.0, rsi_val / 30.0)
+
+        # Volatility regime: amplify in trending markets, dampen in ranging ones.
+        # Compare recent 10-bar vol vs 30-bar baseline to detect regime.
+        if len(closes) >= 30:
+            recent_vol   = (sum((closes[-i] - closes[-i - 1]) ** 2
+                               for i in range(1, 11)) / 10) ** 0.5
+            baseline_vol = (sum((closes[-i] - closes[-i - 1]) ** 2
+                               for i in range(1, 30)) / 29) ** 0.5
+            if baseline_vol > 1e-10:
+                regime = recent_vol / baseline_vol
+                if regime > 1.5:        # high vol / trending → strengthen signal
+                    val = max(-0.15, min(0.15, val * 1.3))
+                elif regime < 0.6:      # low vol / ranging → weaken signal
+                    val *= 0.4
         log.debug(f"  Momentum [{binance_sym}]: raw={raw*8:.3f} rsi={rsi_val:.0f} → {val:.3f}")
     except Exception as e:
         log.debug(f"  Momentum error {binance_sym}: {e}")
@@ -1810,39 +1824,43 @@ def compute_hourly_fair(binance_sym: str, spot: float = 0.0, mins_left: float = 
     Return (fair_up, fair_down) for an hourly up/down market.
 
     Blends two signals:
-      1. Momentum + book-imbalance (always, primary when market is fresh)
-      2. Digital-option pricing off hour open (weighted heavier as expiry nears)
-         — "Is current price above where the hour opened?" is the actual settlement question.
+      1. Momentum + book-imbalance + funding + news (momentum-composite)
+      2. Digital-option P(spot_T > hour_open) — the exact settlement question
 
-    Weight toward option pricing grows from 0% at 60+ min to 80% at 15 min.
-    Clamped to [0.25, 0.75].
+    Option weight has two components:
+      - Time component:        ramps from 0% at 90 min to 80% at ~8 min left
+      - Displacement component: if spot has already moved ≥1% from hour-open,
+                                add up to +40% weight (price has settled direction)
+    Combined weight is capped at 85%. Clamped to [0.25, 0.75].
     """
     mom  = _hourly_momentum(binance_sym)
     imb  = _book_imbalance(binance_sym)
     fund = _funding_rate(binance_sym)
     news = _news_cache.get().get(binance_sym, 0.0) * NEWS_FAIR_NUDGE
-    # Funding rate scaled ×50: typical +0.01% (0.0001) → +0.005 nudge on fair
-    # News nudge: max ±3¢ shift from recent 2h headlines (capped by outer clamp)
-    fair_mom = 0.50 + 2.0 * mom + 0.08 * imb + 50.0 * fund + news
-    fair_mom = max(0.25, min(0.75, fair_mom))
+    fair_mom = max(0.25, min(0.75,
+               0.50 + 2.0 * mom + 0.08 * imb + 50.0 * fund + news))
 
-    # Option-pricing from hour open — only when we have spot and market has < 60 min left
-    fair_opt = None
-    if spot > 0 and mins_left < 60:
+    fair_opt   = None
+    opt_weight = 0.0
+    if spot > 0 and mins_left < 90:
         hour_open = _get_hour_open(binance_sym)
         if hour_open and hour_open > 0:
-            T = max(0.5 / 60 / 24 / 365, mins_left / 60 / 24 / 365)  # years
+            T   = max(0.5 / 60 / 24 / 365, mins_left / 60 / 24 / 365)
             vol = get_live_vol(binance_sym, 0.70, T)
-            # Zero drift for intraday; settlement = price above hour-open
-            p = european_prob(spot, hour_open, T, vol, 0.0, "up")
+            p   = european_prob(spot, hour_open, T, vol, 0.0, "up")
             if p is not None:
                 fair_opt = p
+                # Time component: 0% at 90 min, 80% at ~8 min remaining
+                time_w = max(0.0, min(0.80, (90 - mins_left) / 87.5))
+                # Displacement component: each 1% move from hour-open adds 20% weight.
+                # A 2%+ move → option model is highly informative regardless of time.
+                disp_w = min(0.40, abs(spot - hour_open) / hour_open * 20)
+                opt_weight = min(0.85, time_w + disp_w)
                 log.debug(f"  Hourly opt [{binance_sym}]: S={spot:.2f} K={hour_open:.2f} "
-                          f"T={mins_left:.0f}m vol={vol*100:.0f}% → P(up)={p:.3f}")
+                          f"T={mins_left:.0f}m vol={vol*100:.0f}% P(up)={p:.3f} "
+                          f"w={opt_weight:.2f} (t={time_w:.2f}+d={disp_w:.2f})")
 
     if fair_opt is not None:
-        # Linearly ramp from 0% at 60 min to 80% at 15 min remaining
-        opt_weight = max(0.0, min(0.80, (60 - mins_left) / 56.25))
         fair_up = opt_weight * fair_opt + (1 - opt_weight) * fair_mom
         log.debug(f"  Hourly blend [{binance_sym}]: opt={fair_opt:.3f}×{opt_weight:.2f} "
                   f"+ mom={fair_mom:.3f}×{1-opt_weight:.2f} = {fair_up:.3f}")
@@ -1865,6 +1883,21 @@ NEWS_FAIR_NUDGE  = 0.03   # max ±3¢ shift on hourly fair from news sentiment
 NEWS_VETO_SCORE  = 0.60   # block entry when news strongly opposes direction (≥2 strong keywords)
 _NEWS_TTL        = 600    # re-fetch RSS every 10 minutes
 _NEWS_WINDOW     = 7200   # only count articles published in the last 2 hours
+
+
+def _tod_bet_mult() -> float:
+    """
+    Time-of-day bet sizing multiplier.
+    Asian hours (UTC 02–08): thin books, noisier signals → 40% sizing.
+    US market hours (UTC 13–22): peak liquidity → full sizing.
+    Overnight US / European hours: 75% sizing.
+    """
+    h = datetime.now(timezone.utc).hour
+    if 2 <= h < 8:
+        return 0.40   # Asian low-liquidity window
+    if 13 <= h < 22:
+        return 1.00   # US session peak
+    return 0.75       # European / overnight
 
 
 def is_hourly_updown(question: str) -> bool:
@@ -1994,11 +2027,12 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -
 
         fair_up, fair_down = compute_hourly_fair(binance_sym, spot, mins_left)
         news_score = _news_cache.get().get(asset, 0.0)
+        tod_mult   = _tod_bet_mult()
         tm       = re.search(r"\d{1,2}(?::\d{2})?\s*(?:am|pm)", question, re.I)
         time_str = tm.group(0) if tm else "?"
         log.info(f"  ⏰ {asset} hourly [{time_str} ET | {mins_left:.0f}m left] "
                  f"fair_up={fair_up:.3f} fair_dn={fair_down:.3f} "
-                 f"news={news_score:+.2f}  {question[:40]}")
+                 f"news={news_score:+.2f} tod={tod_mult:.2f}  {question[:40]}")
 
         available  = free_bankroll(bankroll, om)
         market_end = time.time() + mins_left * 60   # unix ts of this market's expiry
@@ -2022,7 +2056,8 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -
                     net_edge = fair_up * (1 - TAKER_FEE) - limit
                     label    = f"{asset} UP {time_str} ET (hourly)"
                     if net_edge >= MIN_HOURLY_EDGE and not om.has_open_order(token_up):
-                        size = min(MAX_HOURLY_BET_USDC, kelly_buy(fair_up, limit, available))
+                        size = min(MAX_HOURLY_BET_USDC * tod_mult,
+                                   kelly_buy(fair_up, limit, available))
                         if size >= MIN_BET_USDC:
                             if place_order(client, om, token_up, limit, size, fair_up, label,
                                            market_end=market_end):
@@ -2046,7 +2081,8 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -
                     net_edge = fair_down * (1 - TAKER_FEE) - limit
                     label    = f"{asset} DOWN {time_str} ET (hourly)"
                     if net_edge >= MIN_HOURLY_EDGE and not om.has_open_order(token_down):
-                        size = min(MAX_HOURLY_BET_USDC, kelly_buy(fair_down, limit, available))
+                        size = min(MAX_HOURLY_BET_USDC * tod_mult,
+                                   kelly_buy(fair_down, limit, available))
                         if size >= MIN_BET_USDC:
                             if place_order(client, om, token_down, limit, size, fair_down, label,
                                            market_end=market_end):
