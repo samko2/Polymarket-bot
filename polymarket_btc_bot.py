@@ -2168,13 +2168,15 @@ class PnL:
         log.info(f"[24h] uptime={uptime} {om.summary()} "
                  f"portfolio=${portfolio:.2f} ({change:+.2f})")
 
-        dd_pct = (((_dd_guard.peak - portfolio) / _dd_guard.peak * 100)
-                  if _dd_guard.peak > 0 else 0.0)
+        # Cash drawdown: compare current cash vs peak cash — what the guard uses.
+        # Positive = above peak (good), negative = drawdown (guard may intervene).
+        cash_vs_peak = ((bankroll - _dd_guard.peak) / _dd_guard.peak * 100) if _dd_guard.peak > 0 else 0.0
+        dd_label = f"⚠️ {abs(cash_vs_peak):.1f}% drawdown" if cash_vs_peak < -DRAWDOWN_WARN_PCT * 100 else f"{cash_vs_peak:+.1f}% vs peak cash"
         tg(f"{emoji} <b>DAILY P&L REPORT</b>\n"
            f"━━━━━━━━━━━━━━━━━\n"
            f"Portfolio: <b>${portfolio:.2f}</b>  ({change:+.2f} / {pct:+.1f}%)\n"
            f"Cash: ${bankroll:.2f}  ·  Positions: ${pos_value:.2f}\n"
-           f"Peak: ${_dd_guard.peak:.2f}  ({dd_pct:+.1f}% from peak)\n"
+           f"Peak cash: ${_dd_guard.peak:.2f}  ({dd_label})\n"
            f"━━━━━━━━━━━━━━━━━\n"
            f"24h orders: {orders}  ·  24h fills: {fills}\n"
            f"Open positions: {len(om.held_positions)}\n"
