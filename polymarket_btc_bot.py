@@ -653,8 +653,11 @@ def scan_exit_positions(client: ClobClient, om: OrderManager, wallet: str = "") 
             )
             if resp and resp.get("success"):
                 log.info(f"    ✓ Exit order placed: {resp.get('orderID','')[:20]}")
-                tg(f"🔴 <b>EXIT</b> {reason}\n"
+                pnl_usdc  = round((sell_price - entry) * shares, 2)
+                pnl_emoji = "🟢" if pnl_usdc >= 0 else "🔴"
+                tg(f"{pnl_emoji} <b>EXIT</b> {reason}\n"
                    f"{shares:.2f}sh  entry={entry:.3f} → sell@{sell_price:.3f}\n"
+                   f"P&L: <b>{pnl_usdc:+.2f} USDC</b>  ({gain*100:+.1f}%)\n"
                    f"{label or token_id[:16]}")
                 _wr_tracker.record_exit(label, won=(gain >= 0))
                 if sell_all:
@@ -2026,6 +2029,29 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -
         spot = spot_map[asset]
 
         fair_up, fair_down = compute_hourly_fair(binance_sym, spot, mins_left)
+
+        # Cross-asset confirmation: count how many other assets' 1m momentum
+        # agrees with the current direction. 2+ agreeing assets = risk-on/off
+        # move, which is a real signal. Nudge fair by 2¢ per confirming asset.
+        if fair_up >= MIN_HOURLY_CONVICTION or fair_down >= MIN_HOURLY_CONVICTION:
+            direction_up = fair_up >= fair_down
+            confirmations = sum(
+                1 for oa, ocfg in HOURLY_ASSETS.items()
+                if oa != asset
+                and abs(_hourly_momentum(ocfg["binance"])) > 0.03
+                and (_hourly_momentum(ocfg["binance"]) > 0) == direction_up
+            )
+            if confirmations >= 2:
+                boost = 0.02 * confirmations
+                if direction_up:
+                    fair_up   = min(0.75, fair_up   + boost)
+                    fair_down = round(1 - fair_up,  4)
+                else:
+                    fair_down = min(0.75, fair_down + boost)
+                    fair_up   = round(1 - fair_down, 4)
+                log.debug(f"    Cross-asset: {confirmations} assets agree → "
+                          f"fair_up={fair_up:.3f}")
+
         news_score = _news_cache.get().get(asset, 0.0)
         tod_mult   = _tod_bet_mult()
         tm       = re.search(r"\d{1,2}(?::\d{2})?\s*(?:am|pm)", question, re.I)
