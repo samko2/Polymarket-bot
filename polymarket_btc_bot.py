@@ -1535,10 +1535,29 @@ _mom_cache: dict[str, tuple[float, float]] = {}   # bsym → (ts, signal)
 _MOM_TTL = 60.0  # seconds between momentum re-fetches
 
 
+def _rsi(closes: list, period: int = 14) -> float:
+    """
+    Wilder RSI from the last `period` 1-min bars. Returns [0, 100].
+    50 = neutral fallback when not enough data.
+    """
+    if len(closes) < period + 1:
+        return 50.0
+    deltas = [closes[i] - closes[i - 1] for i in range(-period, 0)]
+    gains  = sum(max(0.0, d) for d in deltas) / period
+    losses = sum(max(0.0, -d) for d in deltas) / period
+    if losses == 0:
+        return 100.0
+    return 100.0 - 100.0 / (1.0 + gains / losses)
+
+
 def _hourly_momentum(binance_sym: str) -> float:
     """
     Return momentum signal in [-0.15, +0.15] from 1-min Binance klines.
     Positive = bullish (favour UP token).
+
+    RSI dampener: when the 14-period 1m RSI is extreme (>70 overbought /
+    <30 oversold), the momentum signal is linearly faded toward zero because
+    mean-reversion is more likely than continuation before the hour closes.
     """
     now = time.time()
     if binance_sym in _mom_cache:
@@ -1561,6 +1580,15 @@ def _hourly_momentum(binance_sym: str) -> float:
         m2  = (closes[-1] - closes[-3])  / closes[-3]    # 2-bar
         raw = 0.50 * m10 + 0.30 * m5 + 0.20 * m2
         val = max(-0.15, min(0.15, raw * 8))             # scale ×8 then clamp
+
+        # RSI mean-reversion dampener — fade momentum when the move is exhausted.
+        # Linear fade: full signal at RSI=70/30, zero signal at RSI=100/0.
+        rsi_val = _rsi(closes)
+        if rsi_val > 70 and val > 0:
+            val *= max(0.0, (100.0 - rsi_val) / 30.0)
+        elif rsi_val < 30 and val < 0:
+            val *= max(0.0, rsi_val / 30.0)
+        log.debug(f"  Momentum [{binance_sym}]: raw={raw*8:.3f} rsi={rsi_val:.0f} → {val:.3f}")
     except Exception as e:
         log.debug(f"  Momentum error {binance_sym}: {e}")
         val = 0.0
@@ -1745,9 +1773,8 @@ class _NewsCache:
             self._ts     = time.time()
             log.info(
                 f"  News sentiment (2h): "
-                f"BTC={self._scores['BTC']:+.2f}  "
-                f"ETH={self._scores['ETH']:+.2f}  "
-                f"SOL={self._scores['SOL']:+.2f}"
+                + "  ".join(f"{a}={self._scores.get(a, 0.0):+.2f}"
+                             for a in ("BTC", "ETH", "SOL", "XRP", "HYPE"))
             )
         return self._scores
 
