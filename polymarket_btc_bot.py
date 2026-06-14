@@ -101,13 +101,12 @@ MAX_ORDER_AGE_HOURS = 3.0   # cancel unfilled GTC orders older than this
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# ── CryptoPanic ────────────────────────────────────────────────────────────────
-# Set CRYPTOPANIC_TOKEN env var on Railway to activate real sentiment scores.
-# Get token free at cryptopanic.com/developers/api/ after registering.
-# Falls back to RSS keyword matching when token is absent.
-CRYPTOPANIC_TOKEN = os.getenv("CRYPTOPANIC_TOKEN", "")
-_CP_CURRENCY_MAP  = {"BTC": "BTC", "ETH": "ETH", "SOL": "SOL",
-                     "XRP": "XRP", "HYPE": "HYPE"}
+# ── Fear & Greed Index ─────────────────────────────────────────────────────────
+# alternative.me/fng/ — free, no API key, updates daily.
+# Score 0–100: 0=Extreme Fear, 50=Neutral, 100=Extreme Greed.
+# Used as a market-wide crypto sentiment signal (applies to all assets equally).
+_FNG_CACHE: list = [0.0, 0.0]   # [score_0_to_100, timestamp]
+_FNG_TTL   = 3600                # refresh once per hour (index updates daily)
 
 
 def tg(msg: str) -> None:
@@ -1724,8 +1723,10 @@ def _get_hour_open(binance_sym: str) -> float | None:
 
 # ══════════════════════════════════════════════════════════════════════════════
 # NEWS SENTIMENT
-# Primary:  CryptoPanic API  (set CRYPTOPANIC_TOKEN env var — free account)
-# Fallback: CoinTelegraph + CoinDesk RSS keyword matching
+# Primary signal:  Fear & Greed Index (alternative.me — free, no key needed)
+# Secondary signal: CoinTelegraph + CoinDesk RSS keyword matching
+# Both signals are blended: F&G gives market-wide direction, RSS adds
+# asset-specific nuance. Combined score drives NEWS_FAIR_NUDGE on hourly fairs.
 # ══════════════════════════════════════════════════════════════════════════════
 
 _BULLISH_WORDS = frozenset([
@@ -1765,11 +1766,45 @@ def _headline_score(text: str) -> float:
     return max(-1.0, min(1.0, score))
 
 
+def get_fear_greed() -> float:
+    """
+    Fetch the Crypto Fear & Greed Index (alternative.me). Returns a score
+    in [-1.0, +1.0] normalised from the raw 0–100 value:
+       0  (Extreme Fear)  → -1.0
+       50 (Neutral)       →  0.0
+       100 (Extreme Greed) → +1.0
+    Cached for _FNG_TTL seconds; returns last known value on failure.
+    """
+    now = time.time()
+    if _FNG_CACHE[1] and now - _FNG_CACHE[1] < _FNG_TTL:
+        return _FNG_CACHE[0]
+    try:
+        data  = retry_get("https://api.alternative.me/fng/",
+                          params={"limit": 1}, timeout=8).json()
+        raw   = int(data["data"][0]["value"])
+        label = data["data"][0]["value_classification"]
+        score = round((raw - 50) / 50, 3)   # maps 0→-1, 50→0, 100→+1
+        _FNG_CACHE[0] = score
+        _FNG_CACHE[1] = now
+        log.info(f"  Fear & Greed: {raw}/100 ({label}) → score={score:+.2f}")
+        return score
+    except Exception as e:
+        log.debug(f"  Fear & Greed fetch failed: {e}")
+        return _FNG_CACHE[0]   # last known value
+
+
 class _NewsCache:
+    """
+    Blends two free sentiment signals:
+      1. Fear & Greed Index (alternative.me) — market-wide, high quality,
+         no API key. Applied equally to all assets with 60% weight.
+      2. RSS keyword scoring (CoinTelegraph + CoinDesk) — asset-specific,
+         rougher signal. Applied with 40% weight.
+    """
+
     def __init__(self):
         self._ts:     float            = 0.0
         self._scores: dict[str, float] = {a: 0.0 for a in _ASSET_NEWS_KEYWORDS}
-        self._source: str              = "none"
 
     def _parse_pub_date(self, raw: str) -> float:
         try:
@@ -1777,61 +1812,8 @@ class _NewsCache:
         except Exception:
             return 0.0
 
-    def _fetch_cryptopanic(self) -> dict[str, float] | None:
-        """
-        Query CryptoPanic API for each asset. Scores posts using actual
-        community votes (positive/negative) rather than keyword matching.
-        Returns None if token missing or all requests fail.
-        """
-        cutoff  = time.time() - _NEWS_WINDOW
-        result  = {a: 0.0 for a in _ASSET_NEWS_KEYWORDS}
-        any_ok  = False
-        for asset, cp_sym in _CP_CURRENCY_MAP.items():
-            try:
-                data  = retry_get(
-                    "https://cryptopanic.com/api/free/v1/posts/",
-                    params={
-                        "auth_token": CRYPTOPANIC_TOKEN,
-                        "currencies":  cp_sym,
-                        "public":      "true",
-                        "filter":      "hot",
-                    },
-                    timeout=10,
-                ).json()
-                posts  = data.get("results", [])
-                scores = []
-                for post in posts:
-                    # Recency filter
-                    try:
-                        pub_ts = datetime.fromisoformat(
-                            post.get("published_at", "").replace("Z", "+00:00")
-                        ).timestamp()
-                    except Exception:
-                        pub_ts = 0.0
-                    if pub_ts and pub_ts < cutoff:
-                        continue
-                    votes = post.get("votes") or {}
-                    pos   = int(votes.get("positive", 0) or 0)
-                    neg   = int(votes.get("negative", 0) or 0)
-                    imp   = int(votes.get("important", 0) or 0)
-                    total = pos + neg + imp
-                    if total > 0:
-                        # Community vote ratio is the primary signal
-                        scores.append((pos - neg) / total)
-                    else:
-                        # No votes yet — fall back to title keyword score
-                        scores.append(_headline_score(post.get("title", "")))
-                if scores:
-                    result[asset] = round(
-                        max(-1.0, min(1.0, sum(scores) / len(scores))), 3
-                    )
-                    any_ok = True
-            except Exception as e:
-                log.debug(f"  CryptoPanic [{asset}]: {e}")
-        return result if any_ok else None
-
     def _fetch_rss(self) -> dict[str, float]:
-        """Fallback: keyword-score RSS headlines from CoinTelegraph + CoinDesk."""
+        """Asset-specific keyword scoring from CoinTelegraph + CoinDesk RSS."""
         cutoff = time.time() - _NEWS_WINDOW
         totals: dict[str, list[float]] = {k: [] for k in _ASSET_NEWS_KEYWORDS}
         for feed in _RSS_FEEDS:
@@ -1868,21 +1850,21 @@ class _NewsCache:
         return result
 
     def _fetch(self) -> dict[str, float]:
-        if CRYPTOPANIC_TOKEN:
-            data = self._fetch_cryptopanic()
-            if data is not None:
-                self._source = "CryptoPanic"
-                return data
-            log.warning("  CryptoPanic fetch failed — falling back to RSS")
-        self._source = "RSS"
-        return self._fetch_rss()
+        fng      = get_fear_greed()          # market-wide score in [-1, +1]
+        rss      = self._fetch_rss()         # asset-specific scores in [-1, +1]
+        # 60% weight to F&G (reliable, aggregated) + 40% to RSS (asset-specific)
+        result   = {}
+        for asset in _ASSET_NEWS_KEYWORDS:
+            blended = 0.60 * fng + 0.40 * rss.get(asset, 0.0)
+            result[asset] = round(max(-1.0, min(1.0, blended)), 3)
+        return result
 
     def get(self) -> dict[str, float]:
         if time.time() - self._ts >= _NEWS_TTL:
             self._scores = self._fetch()
             self._ts     = time.time()
             log.info(
-                f"  News sentiment [{self._source}]: "
+                "  News sentiment (F&G+RSS): "
                 + "  ".join(f"{a}={self._scores.get(a, 0.0):+.2f}"
                              for a in ("BTC", "ETH", "SOL", "XRP", "HYPE"))
             )
