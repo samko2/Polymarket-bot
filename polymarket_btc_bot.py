@@ -337,13 +337,14 @@ def get_recent_buys(wallet: str, hours: float = 2.0) -> dict[str, float]:
 
 @dataclass
 class TrackedOrder:
-    order_id:  str
-    token_id:  str
-    label:     str
-    limit:     float
-    size_usdc: float
-    fair:      float
-    placed_at: float = field(default_factory=time.time)
+    order_id:    str
+    token_id:    str
+    label:       str
+    limit:       float
+    size_usdc:   float
+    fair:        float
+    placed_at:   float = field(default_factory=time.time)
+    market_end:  float = 0.0   # unix ts of market expiry (0 = unknown / non-expiring)
 
 
 class OrderManager:
@@ -390,8 +391,10 @@ class OrderManager:
         return set(self.held_positions.keys())
 
     def record(self, order_id: str, token_id: str, label: str,
-               limit: float, size_usdc: float, fair: float) -> None:
-        self.orders[order_id]  = TrackedOrder(order_id, token_id, label, limit, size_usdc, fair)
+               limit: float, size_usdc: float, fair: float,
+               market_end: float = 0.0) -> None:
+        self.orders[order_id]  = TrackedOrder(order_id, token_id, label, limit, size_usdc, fair,
+                                              market_end=market_end)
         self.open_token_ids.add(token_id)
         self.order_count      += 1
 
@@ -483,6 +486,25 @@ class OrderManager:
                     self.open_token_ids.discard(tracked.token_id)
                 except Exception as e:
                     log.warning(f"  Cancel aged {oid[:10]} failed: {e}")
+
+    def cancel_expiring_hourly(self, client: ClobClient, mins_before: float = 5.0) -> None:
+        """Cancel open orders for hourly markets that expire within `mins_before` minutes.
+        Prevents orphaned GTC orders that can never fill once the market closes."""
+        if DRY_RUN:
+            return
+        cutoff = time.time() + mins_before * 60
+        for oid, tracked in list(self.orders.items()):
+            if tracked.market_end <= 0 or tracked.market_end > cutoff:
+                continue
+            mins_left = (tracked.market_end - time.time()) / 60
+            log.info(f"  Cancelling expiring hourly order {oid[:10]} "
+                     f"({mins_left:.0f}m left): {tracked.label[:30]}")
+            try:
+                client.cancel_order(OrderPayload(orderID=oid))
+                self.orders.pop(oid, None)
+                self.open_token_ids.discard(tracked.token_id)
+            except Exception as e:
+                log.warning(f"  Cancel expiring {oid[:10]} failed: {e}")
 
     def cancel_all(self, client: ClobClient) -> None:
         if DRY_RUN:
@@ -1295,7 +1317,7 @@ def _rate_limit_ok() -> bool:
 
 def place_order(client: ClobClient, om: OrderManager,
                 token_id: str, limit: float, size_usdc: float,
-                fair: float, label: str) -> bool:
+                fair: float, label: str, market_end: float = 0.0) -> bool:
     POLY_MIN_SHARES = 5                    # Polymarket CLOB rejects orders below 5 shares
     shares = round(size_usdc / limit, 4)
     if shares < POLY_MIN_SHARES:
@@ -1327,7 +1349,8 @@ def place_order(client: ClobClient, om: OrderManager,
                f"Fair: {fair:.3f}  Edge: {fair*(1-TAKER_FEE)-limit:+.3f}\n"
                f"ID: {order_id}")
             if order_id:
-                om.record(order_id, token_id, label, limit, size_usdc, fair)
+                om.record(order_id, token_id, label, limit, size_usdc, fair,
+                          market_end=market_end)
             return True
         log.error(f"  ✗ Rejected: {resp}")
     except Exception as e:
@@ -1977,7 +2000,8 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -
                  f"fair_up={fair_up:.3f} fair_dn={fair_down:.3f} "
                  f"news={news_score:+.2f}  {question[:40]}")
 
-        available = free_bankroll(bankroll, om)
+        available  = free_bankroll(bankroll, om)
+        market_end = time.time() + mins_left * 60   # unix ts of this market's expiry
 
         if fair_up >= MIN_HOURLY_CONVICTION:
             if news_score <= -NEWS_VETO_SCORE:
@@ -2000,7 +2024,8 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -
                     if net_edge >= MIN_HOURLY_EDGE and not om.has_open_order(token_up):
                         size = min(MAX_HOURLY_BET_USDC, kelly_buy(fair_up, limit, available))
                         if size >= MIN_BET_USDC:
-                            if place_order(client, om, token_up, limit, size, fair_up, label):
+                            if place_order(client, om, token_up, limit, size, fair_up, label,
+                                           market_end=market_end):
                                 orders_placed += 1
         elif fair_down >= MIN_HOURLY_CONVICTION:
             if news_score >= NEWS_VETO_SCORE:
@@ -2023,7 +2048,8 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -
                     if net_edge >= MIN_HOURLY_EDGE and not om.has_open_order(token_down):
                         size = min(MAX_HOURLY_BET_USDC, kelly_buy(fair_down, limit, available))
                         if size >= MIN_BET_USDC:
-                            if place_order(client, om, token_down, limit, size, fair_down, label):
+                            if place_order(client, om, token_down, limit, size, fair_down, label,
+                                           market_end=market_end):
                                 orders_placed += 1
         else:
             log.debug(f"    Skip hourly {asset}: no conviction (fair_up={fair_up:.3f} fair_dn={fair_down:.3f})")
@@ -2256,6 +2282,8 @@ def run_loop(client: ClobClient, wallet: str) -> None:
 
         # ── Cancel GTC orders older than MAX_ORDER_AGE_HOURS ─────────────────
         om.cancel_aged(client)
+        # ── Cancel hourly orders whose market expires in <5 min ──────────────
+        om.cancel_expiring_hourly(client, mins_before=5.0)
 
         # ── Re-sync positions from API so memory matches reality ───────────────
         if cycle_start - last_pos_sync > POSITION_SYNC_MINS * 60:
