@@ -101,6 +101,14 @@ MAX_ORDER_AGE_HOURS = 3.0   # cancel unfilled GTC orders older than this
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
 
+# ── CryptoPanic ────────────────────────────────────────────────────────────────
+# Set CRYPTOPANIC_TOKEN env var on Railway to activate real sentiment scores.
+# Get token free at cryptopanic.com/developers/api/ after registering.
+# Falls back to RSS keyword matching when token is absent.
+CRYPTOPANIC_TOKEN = os.getenv("CRYPTOPANIC_TOKEN", "")
+_CP_CURRENCY_MAP  = {"BTC": "BTC", "ETH": "ETH", "SOL": "SOL",
+                     "XRP": "XRP", "HYPE": "HYPE"}
+
 
 def tg(msg: str) -> None:
     if not TG_TOKEN or not TG_CHAT:
@@ -1715,7 +1723,9 @@ def _get_hour_open(binance_sym: str) -> float | None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NEWS SENTIMENT  —  CoinTelegraph + CoinDesk RSS (no API key required)
+# NEWS SENTIMENT
+# Primary:  CryptoPanic API  (set CRYPTOPANIC_TOKEN env var — free account)
+# Fallback: CoinTelegraph + CoinDesk RSS keyword matching
 # ══════════════════════════════════════════════════════════════════════════════
 
 _BULLISH_WORDS = frozenset([
@@ -1758,7 +1768,8 @@ def _headline_score(text: str) -> float:
 class _NewsCache:
     def __init__(self):
         self._ts:     float            = 0.0
-        self._scores: dict[str, float] = {"BTC": 0.0, "ETH": 0.0, "SOL": 0.0}
+        self._scores: dict[str, float] = {a: 0.0 for a in _ASSET_NEWS_KEYWORDS}
+        self._source: str              = "none"
 
     def _parse_pub_date(self, raw: str) -> float:
         try:
@@ -1766,15 +1777,67 @@ class _NewsCache:
         except Exception:
             return 0.0
 
-    def _fetch(self) -> dict[str, float]:
+    def _fetch_cryptopanic(self) -> dict[str, float] | None:
+        """
+        Query CryptoPanic API for each asset. Scores posts using actual
+        community votes (positive/negative) rather than keyword matching.
+        Returns None if token missing or all requests fail.
+        """
+        cutoff  = time.time() - _NEWS_WINDOW
+        result  = {a: 0.0 for a in _ASSET_NEWS_KEYWORDS}
+        any_ok  = False
+        for asset, cp_sym in _CP_CURRENCY_MAP.items():
+            try:
+                data  = retry_get(
+                    "https://cryptopanic.com/api/free/v1/posts/",
+                    params={
+                        "auth_token": CRYPTOPANIC_TOKEN,
+                        "currencies":  cp_sym,
+                        "public":      "true",
+                        "filter":      "hot",
+                    },
+                    timeout=10,
+                ).json()
+                posts  = data.get("results", [])
+                scores = []
+                for post in posts:
+                    # Recency filter
+                    try:
+                        pub_ts = datetime.fromisoformat(
+                            post.get("published_at", "").replace("Z", "+00:00")
+                        ).timestamp()
+                    except Exception:
+                        pub_ts = 0.0
+                    if pub_ts and pub_ts < cutoff:
+                        continue
+                    votes = post.get("votes") or {}
+                    pos   = int(votes.get("positive", 0) or 0)
+                    neg   = int(votes.get("negative", 0) or 0)
+                    imp   = int(votes.get("important", 0) or 0)
+                    total = pos + neg + imp
+                    if total > 0:
+                        # Community vote ratio is the primary signal
+                        scores.append((pos - neg) / total)
+                    else:
+                        # No votes yet — fall back to title keyword score
+                        scores.append(_headline_score(post.get("title", "")))
+                if scores:
+                    result[asset] = round(
+                        max(-1.0, min(1.0, sum(scores) / len(scores))), 3
+                    )
+                    any_ok = True
+            except Exception as e:
+                log.debug(f"  CryptoPanic [{asset}]: {e}")
+        return result if any_ok else None
+
+    def _fetch_rss(self) -> dict[str, float]:
+        """Fallback: keyword-score RSS headlines from CoinTelegraph + CoinDesk."""
         cutoff = time.time() - _NEWS_WINDOW
         totals: dict[str, list[float]] = {k: [] for k in _ASSET_NEWS_KEYWORDS}
         for feed in _RSS_FEEDS:
             try:
-                r = requests.get(
-                    feed, timeout=10,
-                    headers={"User-Agent": "Mozilla/5.0"},
-                )
+                r = requests.get(feed, timeout=10,
+                                 headers={"User-Agent": "Mozilla/5.0"})
                 if r.status_code != 200:
                     continue
                 items = re.findall(r"<item>(.*?)</item>", r.text, re.DOTALL)
@@ -1797,22 +1860,29 @@ class _NewsCache:
                             totals[asset].append(score)
             except Exception as e:
                 log.debug(f"  RSS {feed} failed: {e}")
-
         result: dict[str, float] = {}
         for asset, scores_list in totals.items():
-            if scores_list:
-                raw = sum(scores_list) / len(scores_list)
-                result[asset] = round(max(-1.0, min(1.0, raw)), 3)
-            else:
-                result[asset] = 0.0
+            result[asset] = (round(max(-1.0, min(1.0,
+                             sum(scores_list) / len(scores_list))), 3)
+                             if scores_list else 0.0)
         return result
+
+    def _fetch(self) -> dict[str, float]:
+        if CRYPTOPANIC_TOKEN:
+            data = self._fetch_cryptopanic()
+            if data is not None:
+                self._source = "CryptoPanic"
+                return data
+            log.warning("  CryptoPanic fetch failed — falling back to RSS")
+        self._source = "RSS"
+        return self._fetch_rss()
 
     def get(self) -> dict[str, float]:
         if time.time() - self._ts >= _NEWS_TTL:
             self._scores = self._fetch()
             self._ts     = time.time()
             log.info(
-                f"  News sentiment (2h): "
+                f"  News sentiment [{self._source}]: "
                 + "  ".join(f"{a}={self._scores.get(a, 0.0):+.2f}"
                              for a in ("BTC", "ETH", "SOL", "XRP", "HYPE"))
             )
