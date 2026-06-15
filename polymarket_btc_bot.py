@@ -1117,8 +1117,10 @@ class WinRateTracker:
         h = self._history[mtype]
         return sum(h) / len(h) if len(h) >= WINRATE_MIN_SAMPLE else None
 
-    def kelly_multiplier(self) -> float:
-        wr = self.win_rate("all")
+    def kelly_multiplier(self, mtype: str = "all") -> float:
+        wr = self.win_rate(mtype)
+        if wr is None and mtype != "all":
+            wr = self.win_rate("all")  # fall back to overall when type sample too small
         if wr is None:
             return 1.0   # not enough data — don't penalise yet
         if wr >= 0.60:
@@ -1143,8 +1145,9 @@ class WinRateTracker:
 
 _dd_guard   = DrawdownGuard()
 _wr_tracker = WinRateTracker()
-# Updated at the start of each cycle; all kelly_buy calls use this value.
+# Updated at the start of each cycle; used for logging and per-type sizing.
 _effective_kelly = KELLY_FRACTION
+_dd_mult: float  = 1.0   # cached drawdown multiplier — used by kelly_buy
 
 # Loss cooldown: maps "BTC_UP" / "ETH_DOWN" etc. → timestamp of last stop-loss
 _loss_cooldown: dict[str, float] = {}
@@ -1166,11 +1169,16 @@ def _cooldown_key(label: str) -> str | None:
 # KELLY SIZING
 # ══════════════════════════════════════════════════════════════════════════════
 
-def kelly_buy(fair: float, limit: float, bankroll: float) -> float:
+def kelly_buy(fair: float, limit: float, bankroll: float,
+              mtype: str = "all", max_bet: float = 0.0) -> float:
     if limit <= 0 or limit >= 1 or fair * (1 - TAKER_FEE) <= limit:
         return 0.0
     f_star = (fair * (1 - TAKER_FEE) - limit) / (1 - limit)
-    return round(min(MAX_BET_USDC, max(0.0, _effective_kelly * f_star * bankroll)), 2)
+    # Per-type Kelly: each market type gets its own win-rate multiplier so a bad
+    # run in daily markets doesn't unnecessarily shrink hourly bet sizes and vice versa.
+    kelly = KELLY_FRACTION * _dd_mult * _wr_tracker.kelly_multiplier(mtype)
+    cap = max_bet if max_bet > 0 else MAX_BET_USDC
+    return round(min(cap, max(0.0, kelly * f_star * bankroll)), 2)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1492,6 +1500,8 @@ def process_market(client: ClobClient, om: OrderManager,
 
     # ── Free bankroll = balance minus already-committed USDC ──────────────────
     available = free_bankroll(bankroll, om)
+    # Dynamic max bet: 5% of bankroll, capped at $10. Scales as the account grows.
+    dyn_max = min(10.0, bankroll * 0.05)
 
     if fair >= 0.50:
         # BUY YES — limit below our fair, but at least 1 tick above best bid
@@ -1500,7 +1510,7 @@ def process_market(client: ClobClient, om: OrderManager,
         net_edge = fair * (1 - TAKER_FEE) - limit
         result.update(limit=limit, net_edge=net_edge, side="YES")
         if net_edge >= MIN_EDGE and not om.has_open_order(token_yes):
-            size = kelly_buy(fair, limit, available)
+            size = kelly_buy(fair, limit, available, mtype="daily", max_bet=dyn_max)
             if size >= MIN_BET_USDC:
                 if place_order(client, om, token_yes, limit, size, fair, label):
                     result.update(action=f"BUY YES @{limit:.2f} ${size:.2f}", traded=True)
@@ -1522,7 +1532,7 @@ def process_market(client: ClobClient, om: OrderManager,
         net_edge = fair_no * (1 - TAKER_FEE) - limit
         result.update(limit=limit, net_edge=net_edge, side="NO")
         if net_edge >= MIN_EDGE and token_no and not om.has_open_order(token_no):
-            size = kelly_buy(fair_no, limit, available)
+            size = kelly_buy(fair_no, limit, available, mtype="daily", max_bet=dyn_max)
             if size >= MIN_BET_USDC:
                 if place_order(client, om, token_no, limit, size, fair_no, f"{label} NO"):
                     result.update(action=f"BUY NO  @{limit:.2f} ${size:.2f}", traded=True)
@@ -2155,8 +2165,9 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -
                     net_edge = fair_up * (1 - TAKER_FEE) - limit
                     label    = f"{asset} UP {time_str} ET (hourly)"
                     if net_edge >= MIN_HOURLY_EDGE and not om.has_open_order(token_up):
-                        size = min(MAX_HOURLY_BET_USDC * tod_mult,
-                                   kelly_buy(fair_up, limit, available))
+                        dyn_max_h = min(6.0, bankroll * 0.03) * tod_mult
+                        size = kelly_buy(fair_up, limit, available,
+                                         mtype="hourly", max_bet=dyn_max_h)
                         if size >= MIN_BET_USDC:
                             if place_order(client, om, token_up, limit, size, fair_up, label,
                                            market_end=market_end):
@@ -2180,8 +2191,9 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -
                     net_edge = fair_down * (1 - TAKER_FEE) - limit
                     label    = f"{asset} DOWN {time_str} ET (hourly)"
                     if net_edge >= MIN_HOURLY_EDGE and not om.has_open_order(token_down):
-                        size = min(MAX_HOURLY_BET_USDC * tod_mult,
-                                   kelly_buy(fair_down, limit, available))
+                        dyn_max_h = min(6.0, bankroll * 0.03) * tod_mult
+                        size = kelly_buy(fair_down, limit, available,
+                                         mtype="hourly", max_bet=dyn_max_h)
                         if size >= MIN_BET_USDC:
                             if place_order(client, om, token_down, limit, size, fair_down, label,
                                            market_end=market_end):
@@ -2393,10 +2405,11 @@ def run_loop(client: ClobClient, wallet: str) -> None:
             last_reset = cycle_start
 
         # ── Drawdown guard + dynamic Kelly ────────────────────────────────────
-        global _effective_kelly
+        global _effective_kelly, _dd_mult
         _dd_guard.update(bankroll)
-        dd_mult = _dd_guard.kelly_multiplier(bankroll)
-        wr_mult = _wr_tracker.kelly_multiplier()
+        _dd_mult = _dd_guard.kelly_multiplier(bankroll)   # cached for kelly_buy per-type calc
+        dd_mult  = _dd_mult
+        wr_mult  = _wr_tracker.kelly_multiplier()         # "all" — for display only
         _effective_kelly = round(KELLY_FRACTION * dd_mult * wr_mult, 4)
         if _dd_guard.is_paused:
             log.warning(f"  🚨 Trading paused (drawdown). "
