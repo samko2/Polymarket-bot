@@ -79,6 +79,7 @@ MIN_BOOK_LIQUIDITY    = 0.01    # skip markets with spread wider than 99 cents
 MAX_BOOK_SPREAD       = 0.25    # require a real two-sided book on regular markets too
 POSITION_SYNC_MINS    = 10      # re-sync held positions from Data API every N minutes
 MAX_POSITION_TOKENS   = 50      # max distinct token positions held at once
+MAX_POSITIONS_PER_ASSET = 3    # max open positions in the same asset (correlated risk)
 MANUAL_BANKROLL       = float(os.getenv("MANUAL_BANKROLL", "0"))  # override balance check if set
 
 # ── Drawdown protection ────────────────────────────────────────────────────────
@@ -86,7 +87,7 @@ DRAWDOWN_WARN_PCT  = 0.20   # 20% from peak → halve Kelly + Telegram alert
 DRAWDOWN_PAUSE_PCT = 0.30   # 30% from peak → halt trading entirely
 
 # ── Rolling win-rate (dynamic Kelly) ──────────────────────────────────────────
-WINRATE_WINDOW     = 20     # look back over the last N resolved positions
+WINRATE_WINDOW     = 30     # look back over the last N resolved positions
 WINRATE_MIN_SAMPLE = 5      # need at least this many before adjusting Kelly
 
 # ── Exit tuning ────────────────────────────────────────────────────────────────
@@ -362,6 +363,7 @@ class OrderManager:
         # token_id → avg entry price (0.0 = unknown, exit logic skips those)
         self.held_positions:  dict[str, float] = dict(existing_positions or {})
         self.held_labels:     dict[str, str]   = {}   # token_id → market label for win-rate tracking
+        self.held_market_end: dict[str, float] = {}   # token_id → expiry unix ts (hourly only)
         self.recent_fill_ts:  dict[str, float] = {}   # token_id → fill time
         self.peak_bid:        dict[str, float] = {}   # token_id → highest bid seen (trailing stop)
         self.partial_exit_done: set[str]       = set()  # tokens where first half already sold
@@ -446,6 +448,8 @@ class OrderManager:
                         self.held_positions[tracked.token_id] = fill_price  # true entry price
                         self.held_labels[tracked.token_id]   = tracked.label
                         self.recent_fill_ts[tracked.token_id] = time.time()
+                        if tracked.market_end > 0:
+                            self.held_market_end[tracked.token_id] = tracked.market_end
                         fill_events.append({
                             "label":        tracked.label,
                             "limit":        tracked.limit,
@@ -601,6 +605,15 @@ def scan_exit_positions(client: ClobClient, om: OrderManager, wallet: str = "") 
             is_hourly = "hourly" in label.lower() or " et " in label.lower()
             is_partial = token_id in om.partial_exit_done
 
+            # ── Hold-to-expiry zone (hourly markets only) ─────────────────
+            # Within 10 min of expiry: selling costs taker fee + bid-ask spread
+            # for the same expected value as holding. Settlement is exact (no
+            # slippage) and fee-free — always better than selling early.
+            market_end = om.held_market_end.get(token_id, 0.0)
+            if is_hourly and market_end > 0 and (market_end - time.time()) < 600:
+                log.debug(f"  Hold to expiry {token_id[:12]}…: <10m left, skip exit")
+                continue
+
             reason   = None
             sell_all = True
 
@@ -671,6 +684,7 @@ def scan_exit_positions(client: ClobClient, om: OrderManager, wallet: str = "") 
                 if sell_all:
                     om.held_positions.pop(token_id, None)
                     om.held_labels.pop(token_id, None)
+                    om.held_market_end.pop(token_id, None)
                     om.peak_bid.pop(token_id, None)
                     om.partial_exit_done.discard(token_id)
                     _pos_size_cache.pop(token_id, None)
@@ -1408,6 +1422,12 @@ def process_market(client: ClobClient, om: OrderManager,
     if len(om.held_token_ids) >= MAX_POSITION_TOKENS:
         return None
 
+    # ── Per-asset concentration cap ────────────────────────────────────────────
+    asset_positions = sum(1 for lbl in om.held_labels.values() if asset in lbl)
+    if asset_positions >= MAX_POSITIONS_PER_ASSET:
+        log.debug(f"  Skip {asset}: already holding {asset_positions} positions (cap={MAX_POSITIONS_PER_ASSET})")
+        return None
+
     # ── Parse question ─────────────────────────────────────────────────────────
     end_date = parse_end_date(question, cfg["end_date"])
     sigs     = parse_question(question, spot, end_date)
@@ -2091,6 +2111,12 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -
         if om.already_holds(token_up) or om.already_holds(token_down):
             continue
         if len(om.held_token_ids) >= MAX_POSITION_TOKENS:
+            continue
+
+        # ── Per-asset concentration cap (hourly counts toward the same limit) ─
+        asset_positions = sum(1 for lbl in om.held_labels.values() if asset in lbl)
+        if asset_positions >= MAX_POSITIONS_PER_ASSET:
+            log.debug(f"    Skip {asset} hourly: {asset_positions} positions already held (cap={MAX_POSITIONS_PER_ASSET})")
             continue
 
         # ── Correlation limit: max 1 active hourly position per asset ──────
