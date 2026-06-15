@@ -62,18 +62,19 @@ TICK_SIZE  = "0.01"
 DRY_RUN               = False   # LIVE TRADING
 POLL_INTERVAL         = 20      # seconds between scans
 EDGE_BUFFER           = 0.03    # place limit this far below fair (3%)
-MIN_EDGE              = 0.02    # minimum net edge after fee (2%)
+MIN_EDGE              = 0.03    # minimum net edge after fee (raised 2%→3% to match hourly quality bar)
 TAKER_FEE             = 0.02    # Polymarket taker fee on winnings
 KELLY_FRACTION        = 0.25    # quarter-Kelly
 MAX_BET_USDC          = 5.0     # hard cap per order
 TAKE_PROFIT           = 0.40    # exit when position up ≥40% from entry
 STOP_LOSS             = 0.40    # exit when position down ≥40% from entry
 MIN_BET_USDC          = 0.20    # skip orders below this ($0.50 blocked all kelly bets on $30 bankroll)
-MIN_VOLUME            = 5_000   # min market lifetime volume
+MIN_VOLUME            = 15_000  # raised 5k→15k: thin markets have poor price discovery
 TRADED_RESET_HOURS    = 6       # full reset every N hours
 STALE_FAIR_DRIFT      = 0.12    # cancel order if fair drifted >12%
 PNL_REPORT_HOURS      = 24
-MAX_MODEL_MARKET_GAP  = 0.30    # skip if model and book-mid disagree >30%
+MAX_MODEL_MARKET_GAP  = 0.20    # tightened 30%→20%: market usually right when model disagrees >20¢
+MIN_DAILY_CONVICTION  = 0.60    # daily markets need ≥60% fair — no near-coinflip bets (like hourly has 55%)
 MIN_BOOK_LIQUIDITY    = 0.01    # skip markets with spread wider than 99 cents
 MAX_BOOK_SPREAD       = 0.25    # require a real two-sided book on regular markets too
 POSITION_SYNC_MINS    = 10      # re-sync held positions from Data API every N minutes
@@ -1461,12 +1462,32 @@ def process_market(client: ClobClient, om: OrderManager,
         return None
 
     # Shrink model toward market price — the book aggregates information our
-    # model doesn't have; pure model overestimates tail probabilities
-    fair = round(0.70 * fair + 0.30 * book_mid, 4)
+    # model doesn't have. Weight increases with time horizon: the further out
+    # the market, the less our option model knows vs. collective market wisdom.
+    # Previous 70/30 split led to 40% daily win rate — market was systematically
+    # more accurate. Now 55/45: model guides direction, market sets magnitude.
+    T_days_local = T * 365
+    if T_days_local > 30:
+        # Long-horizon (monthly+): market has much more information — lean on it
+        book_weight = 0.55
+    elif T_days_local > 7:
+        # Weekly: moderate trust split
+        book_weight = 0.45
+    else:
+        # Short-horizon (≤7 days): model is more reliable, smaller book weight
+        book_weight = 0.35
+    fair = round((1 - book_weight) * fair + book_weight * book_mid, 4)
+
+    # Daily conviction gate: skip near-coinflip positions.
+    # Hourly markets require 55% conviction; daily/weekly need 60% — they're
+    # longer duration with more uncertainty, so the bar should be higher.
+    if abs(fair - 0.50) < (MIN_DAILY_CONVICTION - 0.50):
+        log.debug(f"  Skip {label[:40]}: low conviction (fair={fair:.2f})")
+        return None
 
     result = dict(question=question[:65], direction=direction, strike=strike,
                   fair=fair, book_mid=book_mid, gap=round(gap, 3), volume=volume,
-                  T_days=T*365, model=model, action=None, traded=False,
+                  T_days=T_days_local, model=model, action=None, traded=False,
                   limit=0.0, net_edge=0.0, side="?")
 
     # ── Free bankroll = balance minus already-committed USDC ──────────────────
