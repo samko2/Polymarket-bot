@@ -67,14 +67,14 @@ TAKER_FEE             = 0.02    # Polymarket taker fee on winnings
 KELLY_FRACTION        = 0.25    # quarter-Kelly
 MAX_BET_USDC          = 5.0     # hard cap per order
 TAKE_PROFIT           = 0.40    # exit when position up ≥40% from entry
-STOP_LOSS             = 0.40    # exit when position down ≥40% from entry
+STOP_LOSS             = 0.30    # exit when position down ≥30% from entry
 MIN_BET_USDC          = 0.20    # skip orders below this ($0.50 blocked all kelly bets on $30 bankroll)
 MIN_VOLUME            = 15_000  # raised 5k→15k: thin markets have poor price discovery
 TRADED_RESET_HOURS    = 6       # full reset every N hours
 STALE_FAIR_DRIFT      = 0.12    # cancel order if fair drifted >12%
 PNL_REPORT_HOURS      = 24
 MAX_MODEL_MARKET_GAP  = 0.20    # tightened 30%→20%: market usually right when model disagrees >20¢
-MIN_DAILY_CONVICTION  = 0.60    # daily markets need ≥60% fair — no near-coinflip bets (like hourly has 55%)
+MIN_DAILY_CONVICTION  = 0.63    # daily markets need ≥63% fair — tightened given 33% observed win rate
 MIN_BOOK_LIQUIDITY    = 0.01    # skip markets with spread wider than 99 cents
 MAX_BOOK_SPREAD       = 0.25    # require a real two-sided book on regular markets too
 POSITION_SYNC_MINS    = 10      # re-sync held positions from Data API every N minutes
@@ -93,7 +93,7 @@ WINRATE_MIN_SAMPLE = 5      # need at least this many before adjusting Kelly
 # ── Exit tuning ────────────────────────────────────────────────────────────────
 TAKE_PROFIT_2       = 0.70  # second half of partial TP exits at +70%
 TRAIL_STOP_TRIGGER  = 0.25  # start trailing once position is up ≥25%
-TRAIL_STOP_DROP     = 0.15  # exit if bid drops 15% below its peak while trailing
+TRAIL_STOP_DROP     = 0.12  # exit if bid drops 12% below its peak while trailing (tighter to lock gains)
 LOSS_COOLDOWN_HOURS = 1.5   # block same asset+direction for 1.5h after a stop-loss
 
 # ── Order hygiene ──────────────────────────────────────────────────────────────
@@ -1571,6 +1571,8 @@ HOURLY_ASSETS = {
     "SOL":  {"slug_name": "solana",       "binance": "SOL"},
     "XRP":  {"slug_name": "xrp",          "binance": "XRP"},
     "HYPE": {"slug_name": "hyperliquid",  "binance": "HYPE"},
+    "DOGE": {"slug_name": "dogecoin",     "binance": "DOGE"},
+    "AVAX": {"slug_name": "avalanche",    "binance": "AVAX"},
 }
 
 
@@ -1798,6 +1800,8 @@ _ASSET_NEWS_KEYWORDS = {
     "SOL":  ["solana"],
     "XRP":  ["xrp", "ripple"],
     "HYPE": ["hyperliquid"],
+    "DOGE": ["dogecoin", "doge"],
+    "AVAX": ["avalanche", "avax"],
 }
 _RSS_FEEDS = [
     "https://cointelegraph.com/rss",
@@ -2063,7 +2067,9 @@ def _collect_hourly_markets() -> list[tuple[dict, str, str]]:
                   ("ethereum up or down",    "ETH",  "ETH"),
                   ("solana up or down",      "SOL",  "SOL"),
                   ("xrp up or down",         "XRP",  "XRP"),
-                  ("hyperliquid up or down", "HYPE", "HYPE")]
+                  ("hyperliquid up or down", "HYPE", "HYPE"),
+                  ("dogecoin up or down",    "DOGE", "DOGE"),
+                  ("avalanche up or down",   "AVAX", "AVAX")]
         for kw, asset, bsym in kw_map:
             try:
                 for m in search_gamma(kw, limit=20):
@@ -2076,7 +2082,7 @@ def _collect_hourly_markets() -> list[tuple[dict, str, str]]:
 
 def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -> int:
     """
-    Scan current + next-2-hour up/down markets for BTC, ETH, SOL, XRP, HYPE.
+    Scan current + next-2-hour up/down markets for BTC, ETH, SOL, XRP, HYPE, DOGE, AVAX.
     Returns number of orders placed.
     """
     orders_placed = 0
