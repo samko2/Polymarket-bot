@@ -64,7 +64,7 @@ POLL_INTERVAL         = 15      # seconds between scans
 EDGE_BUFFER           = 0.03    # place limit this far below fair (3%)
 MIN_EDGE              = 0.03    # minimum net edge after fee (raised 2%→3% to match hourly quality bar)
 TAKER_FEE             = 0.02    # Polymarket taker fee on winnings
-KELLY_FRACTION        = 0.25    # quarter-Kelly
+KELLY_FRACTION        = 0.30    # 30% Kelly — slightly more aggressive with 8 assets and tighter stops
 MAX_BET_USDC          = 5.0     # hard cap per order
 TAKE_PROFIT           = 0.40    # exit when position up ≥40% from entry
 STOP_LOSS             = 0.30    # exit when position down ≥30% from entry
@@ -1688,7 +1688,8 @@ def _hourly_momentum(binance_sym: str) -> float:
             params={"symbol": binance_sym + "USDT", "interval": "1m", "limit": 30},
             timeout=10,
         ).json()
-        closes = [float(k[4]) for k in klines]
+        closes  = [float(k[4]) for k in klines]
+        volumes = [float(k[5]) for k in klines]
         if len(closes) < 12:
             return 0.0
         # Multi-timeframe momentum, normalised
@@ -1719,6 +1720,16 @@ def _hourly_momentum(binance_sym: str) -> float:
                     val = max(-0.15, min(0.15, val * 1.3))
                 elif regime < 0.6:      # low vol / ranging → weaken signal
                     val *= 0.4
+
+        # Volume confirmation: a price move on above-average volume is genuine;
+        # the same move on thin volume may be noise. Scale [0.5×, 1.8×].
+        if len(volumes) >= 10:
+            avg_vol    = sum(volumes) / len(volumes)
+            recent_avg = sum(volumes[-5:]) / 5
+            if avg_vol > 0:
+                vol_ratio = recent_avg / avg_vol
+                val = max(-0.15, min(0.15, val * max(0.5, min(1.8, vol_ratio))))
+
         log.debug(f"  Momentum [{binance_sym}]: raw={raw*8:.3f} rsi={rsi_val:.0f} → {val:.3f}")
     except Exception as e:
         log.debug(f"  Momentum error {binance_sym}: {e}")
@@ -2204,9 +2215,37 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -
         tod_mult   = _tod_bet_mult()
         tm       = re.search(r"\d{1,2}(?::\d{2})?\s*(?:am|pm)", question, re.I)
         time_str = tm.group(0) if tm else "?"
+
+        # ── Signal consensus gate ──────────────────────────────────────────
+        # All 4 signals are already cached — no extra API calls here.
+        # Score each signal: +1 if it agrees with the dominant direction,
+        # -1 if it opposes, 0 if it's too weak to call. Range: [-4, +4].
+        # Require consensus ≥ 1 to enter; size up when all signals align.
+        direction_up = fair_up >= fair_down
+        mom_s   = _hourly_momentum(binance_sym)
+        imb_s   = _book_imbalance(binance_sym)
+        fund_s  = _funding_rate(binance_sym)
+
+        def _sig(val: float, threshold: float) -> int:
+            if abs(val) < threshold: return 0
+            return 1 if (val > 0) == direction_up else -1
+
+        consensus = (
+            _sig(mom_s,    0.02)  +
+            _sig(imb_s,    0.08)  +
+            _sig(fund_s,   0.0001) +
+            _sig(news_score, 0.10)
+        )
+        # consensus_mult: 1.0× at 2 signals, 1.25× at 3, 1.5× at all 4
+        consensus_mult = 1.0 + max(0, consensus - 2) * 0.25
+
         log.info(f"  ⏰ {asset} hourly [{time_str} ET | {mins_left:.0f}m left] "
                  f"fair_up={fair_up:.3f} fair_dn={fair_down:.3f} "
-                 f"news={news_score:+.2f} tod={tod_mult:.2f}  {question[:40]}")
+                 f"consensus={consensus}/4 news={news_score:+.2f} tod={tod_mult:.2f}  {question[:40]}")
+
+        if consensus <= 0:
+            log.info(f"    Skip {asset} hourly: signals conflict (consensus={consensus}/4)")
+            continue
 
         available  = free_bankroll(bankroll, om)
         market_end = time.time() + mins_left * 60   # unix ts of this market's expiry
@@ -2230,7 +2269,7 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -
                     net_edge = fair_up * (1 - TAKER_FEE) - limit
                     label    = f"{asset} UP {time_str} ET (hourly)"
                     if net_edge >= MIN_HOURLY_EDGE and not om.has_open_order(token_up):
-                        dyn_max_h = min(6.0, bankroll * 0.03) * tod_mult
+                        dyn_max_h = min(6.0, bankroll * 0.03) * tod_mult * consensus_mult
                         size = kelly_buy(fair_up, limit, available,
                                          mtype="hourly", max_bet=dyn_max_h)
                         if size >= MIN_BET_USDC:
@@ -2256,7 +2295,7 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -
                     net_edge = fair_down * (1 - TAKER_FEE) - limit
                     label    = f"{asset} DOWN {time_str} ET (hourly)"
                     if net_edge >= MIN_HOURLY_EDGE and not om.has_open_order(token_down):
-                        dyn_max_h = min(6.0, bankroll * 0.03) * tod_mult
+                        dyn_max_h = min(6.0, bankroll * 0.03) * tod_mult * consensus_mult
                         size = kelly_buy(fair_down, limit, available,
                                          mtype="hourly", max_bet=dyn_max_h)
                         if size >= MIN_BET_USDC:
