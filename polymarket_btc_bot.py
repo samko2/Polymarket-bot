@@ -60,7 +60,7 @@ TICK_SIZE  = "0.01"
 
 # ── Bot config ─────────────────────────────────────────────────────────────────
 DRY_RUN               = False   # LIVE TRADING
-POLL_INTERVAL         = 20      # seconds between scans
+POLL_INTERVAL         = 15      # seconds between scans
 EDGE_BUFFER           = 0.03    # place limit this far below fair (3%)
 MIN_EDGE              = 0.03    # minimum net edge after fee (raised 2%→3% to match hourly quality bar)
 TAKER_FEE             = 0.02    # Polymarket taker fee on winnings
@@ -184,7 +184,37 @@ ASSETS = {
         "coingecko_id":   "hyperliquid",
         "keywords":       ["hyperliquid"],
         "daily_names":    ["hyperliquid", "hype"],
-        "slugs":          [],   # no long-term price target markets
+        "slugs":          [],
+        "end_date": datetime(2026, 12, 31, 23, 59, tzinfo=timezone.utc),
+    },
+    "DOGE": {
+        "vol":            0.90,
+        "drift":          0.15,
+        "binance_symbol": "DOGE",
+        "coingecko_id":   "dogecoin",
+        "keywords":       ["dogecoin", "doge"],
+        "daily_names":    ["dogecoin", "doge"],
+        "slugs":          [],
+        "end_date": datetime(2026, 12, 31, 23, 59, tzinfo=timezone.utc),
+    },
+    "AVAX": {
+        "vol":            0.80,
+        "drift":          0.15,
+        "binance_symbol": "AVAX",
+        "coingecko_id":   "avalanche-2",
+        "keywords":       ["avalanche", "avax"],
+        "daily_names":    ["avalanche", "avax"],
+        "slugs":          [],
+        "end_date": datetime(2026, 12, 31, 23, 59, tzinfo=timezone.utc),
+    },
+    "LINK": {
+        "vol":            0.85,
+        "drift":          0.10,
+        "binance_symbol": "LINK",
+        "coingecko_id":   "chainlink",
+        "keywords":       ["chainlink", "link"],
+        "daily_names":    ["chainlink", "link"],
+        "slugs":          [],
         "end_date": datetime(2026, 12, 31, 23, 59, tzinfo=timezone.utc),
     },
 }
@@ -1573,6 +1603,7 @@ HOURLY_ASSETS = {
     "HYPE": {"slug_name": "hyperliquid",  "binance": "HYPE"},
     "DOGE": {"slug_name": "dogecoin",     "binance": "DOGE"},
     "AVAX": {"slug_name": "avalanche",    "binance": "AVAX"},
+    "LINK": {"slug_name": "chainlink",    "binance": "LINK"},
 }
 
 
@@ -1585,7 +1616,7 @@ def _et_now() -> datetime:
 
 def generate_hourly_slugs() -> list:
     """
-    Return list of (slug, asset, binance_sym) for the current hour + next 2 hours in ET.
+    Return list of (slug, asset, binance_sym) for the current hour + next 3 hours in ET.
     Tries both slug formats Polymarket has used historically.
     """
     et     = _et_now()
@@ -1593,7 +1624,7 @@ def generate_hourly_slugs() -> list:
               "july","august","september","october","november","december"]
     results = []
 
-    for hour_offset in range(3):
+    for hour_offset in range(4):
         ts    = et + timedelta(hours=hour_offset)
         month = months[ts.month - 1]
         day   = ts.day
@@ -1802,6 +1833,7 @@ _ASSET_NEWS_KEYWORDS = {
     "HYPE": ["hyperliquid"],
     "DOGE": ["dogecoin", "doge"],
     "AVAX": ["avalanche", "avax"],
+    "LINK": ["chainlink", "link"],
 }
 _RSS_FEEDS = [
     "https://cointelegraph.com/rss",
@@ -1983,7 +2015,7 @@ def compute_hourly_fair(binance_sym: str, spot: float = 0.0, mins_left: float = 
 
 MIN_HOURLY_VOLUME    = 10     # hourly markets are new each hour — volume is always tiny early
 MIN_HOURLY_MINS      = 15     # skip hourly markets with <15 min to expiry
-HOURLY_EDGE_BUFFER   = 0.015  # tighter than regular 3% — hourly fairs cluster near 50¢
+HOURLY_EDGE_BUFFER   = 0.010  # tighter than regular 3% — hourly fairs cluster near 50¢
 MAX_HOURLY_SPREAD    = 0.30   # require a real two-sided book (skip 0.01/0.99 empty shells)
 MIN_HOURLY_BID       = 0.05   # require a real bid — avoids adverse selection in dead books
 MIN_HOURLY_CONVICTION = 0.55  # require ≥55¢ fair before entering — no near-coinflip bets
@@ -2069,7 +2101,8 @@ def _collect_hourly_markets() -> list[tuple[dict, str, str]]:
                   ("xrp up or down",         "XRP",  "XRP"),
                   ("hyperliquid up or down", "HYPE", "HYPE"),
                   ("dogecoin up or down",    "DOGE", "DOGE"),
-                  ("avalanche up or down",   "AVAX", "AVAX")]
+                  ("avalanche up or down",   "AVAX", "AVAX"),
+                  ("chainlink up or down",   "LINK", "LINK")]
         for kw, asset, bsym in kw_map:
             try:
                 for m in search_gamma(kw, limit=20):
@@ -2082,7 +2115,7 @@ def _collect_hourly_markets() -> list[tuple[dict, str, str]]:
 
 def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -> int:
     """
-    Scan current + next-2-hour up/down markets for BTC, ETH, SOL, XRP, HYPE, DOGE, AVAX.
+    Scan current + next-3-hour up/down markets for BTC, ETH, SOL, XRP, HYPE, DOGE, AVAX, LINK.
     Returns number of orders placed.
     """
     orders_placed = 0
