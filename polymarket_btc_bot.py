@@ -65,7 +65,7 @@ EDGE_BUFFER           = 0.03    # place limit this far below fair (3%)
 MIN_EDGE              = 0.03    # minimum net edge after fee (raised 2%→3% to match hourly quality bar)
 TAKER_FEE             = 0.02    # Polymarket taker fee on winnings
 KELLY_FRACTION        = 0.35    # 35% Kelly — more aggressive sizing
-MAX_BET_USDC          = 5.0     # hard cap per order
+MAX_BET_USDC          = 8.0     # hard cap per order — raised to let high-edge trades get full Kelly size
 TAKE_PROFIT           = 0.40    # exit when position up ≥40% from entry
 STOP_LOSS             = 0.20    # exit when position down ≥20% — tighter to exit before near-expiry collapse
 MIN_BET_USDC          = 0.20    # skip orders below this ($0.50 blocked all kelly bets on $30 bankroll)
@@ -92,7 +92,7 @@ WINRATE_MIN_SAMPLE = 5      # need at least this many before adjusting Kelly
 
 # ── Exit tuning ────────────────────────────────────────────────────────────────
 TAKE_PROFIT_2       = 0.70  # second half of partial TP exits at +70%
-TRAIL_STOP_TRIGGER  = 0.25  # start trailing once position is up ≥25%
+TRAIL_STOP_TRIGGER  = 0.20  # start trailing once position is up ≥20% — protect gains sooner
 TRAIL_STOP_DROP     = 0.10  # exit if bid drops 10% below its peak while trailing
 LOSS_COOLDOWN_HOURS = 1.0   # block same asset+direction for 1h after a stop-loss (faster recovery)
 
@@ -2056,7 +2056,7 @@ HOURLY_EDGE_BUFFER   = 0.010  # tighter than regular 3% — hourly fairs cluster
 MAX_HOURLY_SPREAD    = 0.30   # require a real two-sided book (skip 0.01/0.99 empty shells)
 MIN_HOURLY_BID       = 0.05   # require a real bid — avoids adverse selection in dead books
 MIN_HOURLY_CONVICTION = 0.55  # require ≥55¢ fair before entering — no near-coinflip bets
-MIN_HOURLY_EDGE      = 0.03   # hourly markets need more edge than regular (noisier signal)
+MIN_HOURLY_EDGE      = 0.025  # consensus gate handles quality; lower bar finds more opportunities
 MAX_HOURLY_BET_USDC  = 3.0    # cap hourly bets lower than regular $5 max
 NEWS_FAIR_NUDGE  = 0.03   # max ±3¢ shift on hourly fair from news sentiment
 NEWS_VETO_SCORE  = 0.60   # block entry when news strongly opposes direction (≥2 strong keywords)
