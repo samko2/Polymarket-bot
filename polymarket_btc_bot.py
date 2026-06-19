@@ -1222,6 +1222,7 @@ class WinRateTracker:
         log.info(f"  📊 Win-rate update [{mtype}] {'WIN' if won else 'LOSS'} — "
                  f"all:{wr*100:.0f}% over {len(self._history['all'])} trades"
                  if wr is not None else f"  📊 Exit recorded [{mtype}]")
+        _save_state()  # persist immediately so restarts don't lose this result
 
     def win_rate(self, mtype: str = "all") -> float | None:
         h = self._history[mtype]
@@ -1261,6 +1262,56 @@ _dd_mult: float  = 1.0   # cached drawdown multiplier — used by kelly_buy
 
 # Loss cooldown: maps "BTC_UP" / "ETH_DOWN" etc. → timestamp of last stop-loss
 _loss_cooldown: dict[str, float] = {}
+
+# ── State persistence ──────────────────────────────────────────────────────────
+# Survives process crashes and container restarts within the same Railway deploy.
+# Lost on new deploys (code pushes) — add a Railway Volume for full persistence.
+_STATE_FILE = os.getenv("STATE_FILE", "bot_state.json")
+
+
+def _save_state() -> None:
+    """Write win-rate history, loss cooldowns and DD peak to disk."""
+    try:
+        now = time.time()
+        data = {
+            "winrate":  {k: list(v) for k, v in _wr_tracker._history.items()},
+            "cooldown": {k: v for k, v in _loss_cooldown.items()
+                         if now - v < LOSS_COOLDOWN_HOURS * 3600},
+            "dd_peak":  _dd_guard.peak,
+            "saved_at": now,
+        }
+        with open(_STATE_FILE, "w") as fh:
+            json.dump(data, fh)
+    except Exception as e:
+        log.debug(f"State save failed: {e}")
+
+
+def _load_state() -> None:
+    """Restore win-rate history, loss cooldowns and DD peak from disk."""
+    try:
+        with open(_STATE_FILE) as fh:
+            data = json.load(fh)
+        # Win-rate history
+        for mtype, outcomes in data.get("winrate", {}).items():
+            for outcome in outcomes[-WINRATE_WINDOW:]:
+                _wr_tracker._history[mtype].append(bool(outcome))
+        # Loss cooldowns — skip any that have already expired
+        now = time.time()
+        for key, ts in data.get("cooldown", {}).items():
+            if now - float(ts) < LOSS_COOLDOWN_HOURS * 3600:
+                _loss_cooldown[key] = float(ts)
+        # Drawdown peak
+        peak = float(data.get("dd_peak", 0.0))
+        if peak > 0:
+            _dd_guard.peak = peak
+        age_h = (now - float(data.get("saved_at", now))) / 3600
+        log.info(f"  🔄 State restored (saved {age_h:.1f}h ago): "
+                 f"win-rate={_wr_tracker.summary()}  "
+                 f"cooldowns={len(_loss_cooldown)}  dd_peak=${_dd_guard.peak:.2f}")
+    except FileNotFoundError:
+        log.info("  No saved state — starting fresh")
+    except Exception as e:
+        log.warning(f"  State load failed: {e}")
 
 
 def _cooldown_key(label: str) -> str | None:
@@ -2671,6 +2722,7 @@ def run_loop(client: ClobClient, wallet: str) -> None:
     last_reset = time.time()
 
     log.info(f"Loop started. Balance: ${bankroll:.2f}  Positions loaded: {len(om.held_token_ids)}")
+    _load_state()   # restore win-rate, cooldowns and DD peak from previous session
     pnl.snapshot_baseline(bankroll)
     # Drain any stale Telegram updates so old /report commands don't double-fire
     _poll_tg_commands()
