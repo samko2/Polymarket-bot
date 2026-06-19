@@ -1918,6 +1918,53 @@ def _polymarket_price_momentum(token_id: str) -> float:
         return _pm_price_cache.get(token_id, (0, 0.0))[1]
 
 
+_five_min_cache: dict[str, tuple[float, float]] = {}  # asset → (sentiment, ts)
+_FIVE_MIN_TTL   = 45.0   # refresh every 45s
+
+_FIVE_MIN_SLUGS: dict[str, str] = {
+    "BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana",
+    "XRP": "xrp",     "DOGE": "dogecoin", "AVAX": "avalanche",
+    "LINK": "chainlink", "HYPE": "hyperliquid", "SUI": "sui",
+    "PEPE": "pepe",   "ADA": "cardano",  "TON": "toncoin",
+}
+
+def _five_min_sentiment(asset: str) -> float:
+    """
+    Find the live Polymarket '5-minute up or down' market for this asset and
+    return the YES mid-price as a short-term sentiment signal.
+    Returns value in [-0.50, +0.50]:
+      positive = Polymarket 5-min traders expect price UP (bullish now)
+      negative = bearish now
+      0.0      = no 5-minute market found (safe no-op)
+    Cached 45s — these markets move fast but we don't need tick-level refresh.
+    """
+    now = time.time()
+    cached = _five_min_cache.get(asset)
+    if cached and now - cached[0] < _FIVE_MIN_TTL:
+        return cached[1]
+    name = _FIVE_MIN_SLUGS.get(asset, asset.lower())
+    try:
+        for kw in (f"{name} 5 minute", f"{name} 5-minute", f"will {name} be up in 5"):
+            for m in search_gamma(kw, limit=10):
+                q = m.get("question", "").lower()
+                if "5 min" not in q and "5-min" not in q:
+                    continue
+                tokens = m.get("clobTokenIds") or []
+                if not tokens:
+                    continue
+                bid, ask, book_mid, liquid = get_order_book(tokens[0])
+                if liquid and 0.05 < book_mid < 0.95:
+                    val = round(book_mid - 0.50, 4)   # positive = YES likely
+                    _five_min_cache[asset] = (now, val)
+                    log.debug(f"  5-min sentiment [{asset}]: {val:+.4f} "
+                              f"(yes_mid={book_mid:.3f}  q={m.get('question','')[:40]})")
+                    return val
+    except Exception:
+        pass
+    _five_min_cache[asset] = (now, 0.0)
+    return 0.0
+
+
 _hour_open_cache: dict[str, tuple[float, float]] = {}  # sym → (ts, open_price)
 _HOUR_OPEN_TTL = 120.0  # refresh every 2 min
 
@@ -2350,34 +2397,35 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -
         # Range: [-5, +5]. Require consensus ≥ 1 to enter.
         # Size up: 1.2× at 3 agreeing, 1.4× at 4, 1.6× at all 5.
         direction_up = fair_up >= fair_down
-        mom_s    = _hourly_momentum(binance_sym)
-        imb_s    = _book_imbalance(binance_sym)
-        fund_s   = _funding_rate(binance_sym)
-        # Polymarket live price trend — the actual chart on the Polymarket UI.
-        # Fetch the UP token's trend; _sig maps it to the current direction.
-        pm_mom_s = _polymarket_price_momentum(token_up)
+        mom_s      = _hourly_momentum(binance_sym)
+        imb_s      = _book_imbalance(binance_sym)
+        fund_s     = _funding_rate(binance_sym)
+        pm_mom_s   = _polymarket_price_momentum(token_up)   # live Polymarket chart trend
+        five_min_s = _five_min_sentiment(asset)             # 5-min market YES price
 
         def _sig(val: float, threshold: float) -> int:
             if abs(val) < threshold: return 0
             return 1 if (val > 0) == direction_up else -1
 
         consensus = (
-            _sig(mom_s,      0.02)   +
-            _sig(imb_s,      0.08)   +
-            _sig(fund_s,     0.0001) +
-            _sig(news_score, 0.10)   +
-            _sig(pm_mom_s,   0.03)   # Polymarket live chart trend
+            _sig(mom_s,       0.02)   +   # Binance price momentum
+            _sig(imb_s,       0.08)   +   # Binance order book imbalance
+            _sig(fund_s,      0.0001) +   # Binance funding rate
+            _sig(news_score,  0.10)   +   # Fear & Greed / news sentiment
+            _sig(pm_mom_s,    0.03)   +   # Polymarket live chart trend (last 20 min)
+            _sig(five_min_s,  0.05)       # Polymarket 5-min market crowd sentiment
         )
-        # consensus_mult: 1.0× base, +0.20× per signal above 2 (max 1.6× at 5/5)
+        # consensus_mult: 1.0× base, +0.20× per signal above 2 (max 1.8× at 6/6)
         consensus_mult = 1.0 + max(0, consensus - 2) * 0.20
 
         log.info(f"  ⏰ {asset} hourly [{time_str} ET | {mins_left:.0f}m left] "
                  f"fair_up={fair_up:.3f} fair_dn={fair_down:.3f} "
-                 f"consensus={consensus}/5 pm_mom={pm_mom_s:+.3f} news={news_score:+.2f} "
-                 f"tod={tod_mult:.2f}  {question[:40]}")
+                 f"consensus={consensus}/6 pm_mom={pm_mom_s:+.3f} "
+                 f"5min={five_min_s:+.3f} news={news_score:+.2f} tod={tod_mult:.2f}  "
+                 f"{question[:40]}")
 
         if consensus <= 0:
-            log.info(f"    Skip {asset} hourly: signals conflict (consensus={consensus}/5)")
+            log.info(f"    Skip {asset} hourly: signals conflict (consensus={consensus}/6)")
             continue
 
         available  = free_bankroll(bankroll, om)
