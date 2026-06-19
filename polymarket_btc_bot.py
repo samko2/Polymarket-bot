@@ -1863,6 +1863,61 @@ def _funding_rate(binance_sym: str) -> float:
         return _funding_cache.get(binance_sym, (0, 0.0))[1]
 
 
+_pm_price_cache: dict[str, tuple[float, float]] = {}  # token_id → (momentum, ts)
+_PM_PRICE_TTL   = 30.0   # refresh every 30s — fast enough to catch live moves
+
+def _polymarket_price_momentum(token_id: str) -> float:
+    """
+    Fetch the last 20 minutes of Polymarket CLOB price history for a token
+    (the same line chart visible on the Polymarket website) and return a
+    momentum value in [-0.15, +0.15]:
+      positive  = token price trending UP on Polymarket
+      negative  = token price trending DOWN on Polymarket
+      near-zero = price flat / insufficient data
+
+    Used as a 5th consensus signal: if Polymarket participants are also
+    pushing the YES price upward, that confirms our model's UP edge.
+    Cached per token_id for _PM_PRICE_TTL seconds to avoid hammering the API.
+    """
+    now = time.time()
+    cached = _pm_price_cache.get(token_id)
+    if cached and now - cached[0] < _PM_PRICE_TTL:
+        return cached[1]
+    try:
+        end_ts   = int(now)
+        start_ts = end_ts - 1200  # last 20 minutes
+        resp = retry_get(
+            "https://clob.polymarket.com/prices-history",
+            params={
+                "market":   token_id,
+                "fidelity": 1,       # 1-minute bars
+                "startTs":  start_ts,
+                "endTs":    end_ts,
+            },
+            timeout=8,
+        ).json()
+        history = resp.get("history", []) if isinstance(resp, dict) else []
+        prices  = [float(pt["p"]) for pt in history if isinstance(pt, dict) and "p" in pt]
+        if len(prices) < 4:
+            _pm_price_cache[token_id] = (now, 0.0)
+            return 0.0
+        # Compare the last 5 prices vs the first half as baseline
+        mid        = max(1, len(prices) // 2)
+        recent_avg = sum(prices[-5:]) / min(5, len(prices))
+        early_avg  = sum(prices[:mid]) / mid
+        if early_avg <= 0:
+            _pm_price_cache[token_id] = (now, 0.0)
+            return 0.0
+        mom = (recent_avg - early_avg) / early_avg
+        mom = max(-0.15, min(0.15, mom))
+        _pm_price_cache[token_id] = (now, mom)
+        log.debug(f"  PM price momentum [{token_id[:12]}…]: {mom:+.4f} "
+                  f"({len(prices)} bars, recent={recent_avg:.3f} early={early_avg:.3f})")
+        return mom
+    except Exception:
+        return _pm_price_cache.get(token_id, (0, 0.0))[1]
+
+
 _hour_open_cache: dict[str, tuple[float, float]] = {}  # sym → (ts, open_price)
 _HOUR_OPEN_TTL = 120.0  # refresh every 2 min
 
@@ -2291,34 +2346,38 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -
         time_str = tm.group(0) if tm else "?"
 
         # ── Signal consensus gate ──────────────────────────────────────────
-        # All 4 signals are already cached — no extra API calls here.
-        # Score each signal: +1 if it agrees with the dominant direction,
-        # -1 if it opposes, 0 if it's too weak to call. Range: [-4, +4].
-        # Require consensus ≥ 1 to enter; size up when all signals align.
+        # 5 signals scored +1/-1/0 based on agreement with dominant direction.
+        # Range: [-5, +5]. Require consensus ≥ 1 to enter.
+        # Size up: 1.2× at 3 agreeing, 1.4× at 4, 1.6× at all 5.
         direction_up = fair_up >= fair_down
-        mom_s   = _hourly_momentum(binance_sym)
-        imb_s   = _book_imbalance(binance_sym)
-        fund_s  = _funding_rate(binance_sym)
+        mom_s    = _hourly_momentum(binance_sym)
+        imb_s    = _book_imbalance(binance_sym)
+        fund_s   = _funding_rate(binance_sym)
+        # Polymarket live price trend — the actual chart on the Polymarket UI.
+        # Fetch the UP token's trend; _sig maps it to the current direction.
+        pm_mom_s = _polymarket_price_momentum(token_up)
 
         def _sig(val: float, threshold: float) -> int:
             if abs(val) < threshold: return 0
             return 1 if (val > 0) == direction_up else -1
 
         consensus = (
-            _sig(mom_s,    0.02)  +
-            _sig(imb_s,    0.08)  +
-            _sig(fund_s,   0.0001) +
-            _sig(news_score, 0.10)
+            _sig(mom_s,      0.02)   +
+            _sig(imb_s,      0.08)   +
+            _sig(fund_s,     0.0001) +
+            _sig(news_score, 0.10)   +
+            _sig(pm_mom_s,   0.03)   # Polymarket live chart trend
         )
-        # consensus_mult: 1.0× at 2 signals, 1.25× at 3, 1.5× at all 4
-        consensus_mult = 1.0 + max(0, consensus - 2) * 0.25
+        # consensus_mult: 1.0× base, +0.20× per signal above 2 (max 1.6× at 5/5)
+        consensus_mult = 1.0 + max(0, consensus - 2) * 0.20
 
         log.info(f"  ⏰ {asset} hourly [{time_str} ET | {mins_left:.0f}m left] "
                  f"fair_up={fair_up:.3f} fair_dn={fair_down:.3f} "
-                 f"consensus={consensus}/4 news={news_score:+.2f} tod={tod_mult:.2f}  {question[:40]}")
+                 f"consensus={consensus}/5 pm_mom={pm_mom_s:+.3f} news={news_score:+.2f} "
+                 f"tod={tod_mult:.2f}  {question[:40]}")
 
         if consensus <= 0:
-            log.info(f"    Skip {asset} hourly: signals conflict (consensus={consensus}/4)")
+            log.info(f"    Skip {asset} hourly: signals conflict (consensus={consensus}/5)")
             continue
 
         available  = free_bankroll(bankroll, om)
