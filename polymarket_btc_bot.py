@@ -243,6 +243,46 @@ ASSETS = {
         "slugs":          [],
         "end_date": datetime(2026, 12, 31, 23, 59, tzinfo=timezone.utc),
     },
+    "SUI": {
+        "vol":            0.95,
+        "drift":          0.30,
+        "binance_symbol": "SUI",
+        "coingecko_id":   "sui",
+        "keywords":       ["sui"],
+        "daily_names":    ["sui"],
+        "slugs":          [],
+        "end_date": datetime(2026, 12, 31, 23, 59, tzinfo=timezone.utc),
+    },
+    "PEPE": {
+        "vol":            1.20,
+        "drift":          0.20,
+        "binance_symbol": "PEPE",
+        "coingecko_id":   "pepe",
+        "keywords":       ["pepe"],
+        "daily_names":    ["pepe"],
+        "slugs":          [],
+        "end_date": datetime(2026, 12, 31, 23, 59, tzinfo=timezone.utc),
+    },
+    "ADA": {
+        "vol":            0.70,
+        "drift":          0.10,
+        "binance_symbol": "ADA",
+        "coingecko_id":   "cardano",
+        "keywords":       ["cardano", "ada"],
+        "daily_names":    ["cardano", "ada"],
+        "slugs":          [],
+        "end_date": datetime(2026, 12, 31, 23, 59, tzinfo=timezone.utc),
+    },
+    "TON": {
+        "vol":            0.80,
+        "drift":          0.15,
+        "binance_symbol": "TON",
+        "coingecko_id":   "the-open-network",
+        "keywords":       ["toncoin", "ton"],
+        "daily_names":    ["toncoin", "ton"],
+        "slugs":          [],
+        "end_date": datetime(2026, 12, 31, 23, 59, tzinfo=timezone.utc),
+    },
 }
 
 # ── Caches ─────────────────────────────────────────────────────────────────────
@@ -1630,6 +1670,10 @@ HOURLY_ASSETS = {
     "DOGE": {"slug_name": "dogecoin",     "binance": "DOGE"},
     "AVAX": {"slug_name": "avalanche",    "binance": "AVAX"},
     "LINK": {"slug_name": "chainlink",    "binance": "LINK"},
+    "SUI":  {"slug_name": "sui",          "binance": "SUI"},
+    "PEPE": {"slug_name": "pepe",         "binance": "PEPE"},
+    "ADA":  {"slug_name": "cardano",      "binance": "ADA"},
+    "TON":  {"slug_name": "toncoin",      "binance": "TON"},
 }
 
 
@@ -2139,7 +2183,11 @@ def _collect_hourly_markets() -> list[tuple[dict, str, str]]:
                   ("hyperliquid up or down", "HYPE", "HYPE"),
                   ("dogecoin up or down",    "DOGE", "DOGE"),
                   ("avalanche up or down",   "AVAX", "AVAX"),
-                  ("chainlink up or down",   "LINK", "LINK")]
+                  ("chainlink up or down",   "LINK", "LINK"),
+                  ("sui up or down",         "SUI",  "SUI"),
+                  ("pepe up or down",        "PEPE", "PEPE"),
+                  ("cardano up or down",     "ADA",  "ADA"),
+                  ("toncoin up or down",     "TON",  "TON")]
         for kw, asset, bsym in kw_map:
             try:
                 for m in search_gamma(kw, limit=20):
