@@ -64,10 +64,10 @@ POLL_INTERVAL         = 15      # seconds between scans
 EDGE_BUFFER           = 0.03    # place limit this far below fair (3%)
 MIN_EDGE              = 0.03    # minimum net edge after fee (raised 2%→3% to match hourly quality bar)
 TAKER_FEE             = 0.02    # Polymarket taker fee on winnings
-KELLY_FRACTION        = 0.30    # 30% Kelly — slightly more aggressive with 8 assets and tighter stops
+KELLY_FRACTION        = 0.35    # 35% Kelly — more aggressive sizing
 MAX_BET_USDC          = 5.0     # hard cap per order
 TAKE_PROFIT           = 0.40    # exit when position up ≥40% from entry
-STOP_LOSS             = 0.30    # exit when position down ≥30% from entry
+STOP_LOSS             = 0.20    # exit when position down ≥20% — tighter to exit before near-expiry collapse
 MIN_BET_USDC          = 0.20    # skip orders below this ($0.50 blocked all kelly bets on $30 bankroll)
 MIN_VOLUME            = 15_000  # raised 5k→15k: thin markets have poor price discovery
 TRADED_RESET_HOURS    = 6       # full reset every N hours
@@ -93,8 +93,8 @@ WINRATE_MIN_SAMPLE = 5      # need at least this many before adjusting Kelly
 # ── Exit tuning ────────────────────────────────────────────────────────────────
 TAKE_PROFIT_2       = 0.70  # second half of partial TP exits at +70%
 TRAIL_STOP_TRIGGER  = 0.25  # start trailing once position is up ≥25%
-TRAIL_STOP_DROP     = 0.12  # exit if bid drops 12% below its peak while trailing (tighter to lock gains)
-LOSS_COOLDOWN_HOURS = 1.5   # block same asset+direction for 1.5h after a stop-loss
+TRAIL_STOP_DROP     = 0.10  # exit if bid drops 10% below its peak while trailing
+LOSS_COOLDOWN_HOURS = 1.0   # block same asset+direction for 1h after a stop-loss (faster recovery)
 
 # ── Order hygiene ──────────────────────────────────────────────────────────────
 MAX_ORDER_AGE_HOURS = 3.0   # cancel unfilled GTC orders older than this
@@ -2295,7 +2295,7 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -
                     net_edge = fair_up * (1 - TAKER_FEE) - limit
                     label    = f"{asset} UP {time_str} ET (hourly)"
                     if net_edge >= MIN_HOURLY_EDGE and not om.has_open_order(token_up):
-                        dyn_max_h = min(6.0, bankroll * 0.03) * tod_mult * consensus_mult
+                        dyn_max_h = min(6.0, bankroll * 0.05) * tod_mult * consensus_mult
                         size = kelly_buy(fair_up, limit, available,
                                          mtype="hourly", max_bet=dyn_max_h)
                         if size >= MIN_BET_USDC:
@@ -2321,7 +2321,7 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -
                     net_edge = fair_down * (1 - TAKER_FEE) - limit
                     label    = f"{asset} DOWN {time_str} ET (hourly)"
                     if net_edge >= MIN_HOURLY_EDGE and not om.has_open_order(token_down):
-                        dyn_max_h = min(6.0, bankroll * 0.03) * tod_mult * consensus_mult
+                        dyn_max_h = min(6.0, bankroll * 0.05) * tod_mult * consensus_mult
                         size = kelly_buy(fair_down, limit, available,
                                          mtype="hourly", max_bet=dyn_max_h)
                         if size >= MIN_BET_USDC:
