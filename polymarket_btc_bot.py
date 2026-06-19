@@ -124,6 +124,32 @@ def tg(msg: str) -> None:
         log.warning(f"Telegram failed: {e}")
 
 
+_tg_offset: int = 0
+
+def _poll_tg_commands() -> list[str]:
+    """Poll Telegram for incoming /commands from the configured chat. Returns list of command strings."""
+    global _tg_offset
+    if not TG_TOKEN or not TG_CHAT:
+        return []
+    try:
+        resp = requests.get(
+            f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates",
+            params={"offset": _tg_offset, "limit": 20, "timeout": 0},
+            timeout=8,
+        ).json()
+        commands: list[str] = []
+        for update in resp.get("result", []):
+            _tg_offset = update["update_id"] + 1
+            msg  = update.get("message", {})
+            text = msg.get("text", "").strip().lower()
+            chat_id = str(msg.get("chat", {}).get("id", ""))
+            if chat_id == TG_CHAT and text.startswith("/"):
+                commands.append(text.split()[0])  # just the command, ignore args
+        return commands
+    except Exception:
+        return []
+
+
 # ── Asset config ───────────────────────────────────────────────────────────────
 ASSETS = {
     "BTC": {
@@ -2425,13 +2451,12 @@ class PnL:
         self.last_portfolio = round(bankroll + get_positions_value(self.wallet), 2)
         log.info(f"  P&L baseline: ${self.last_portfolio:.2f} (cash + positions)")
 
-    def maybe_report(self, om: OrderManager, bankroll: float) -> None:
-        now_utc = datetime.now(timezone.utc)
-        # Fire once per day at 9:00–9:05am UTC
-        if now_utc.hour != 9 or now_utc.minute > 5:
+    def maybe_report(self, om: OrderManager, bankroll: float,
+                     force: bool = False) -> None:
+        # Fire every 24h from the last report, or immediately if forced.
+        # Previously tied to 9am UTC — that caused missed reports on restarts.
+        if not force and time.time() - self.last_report < PNL_REPORT_HOURS * 3600:
             return
-        if time.time() - self.last_report < 3600:
-            return  # already reported within this 9am window
 
         uptime    = str(datetime.now(timezone.utc) - self.start).split(".")[0]
         pos_value = get_positions_value(self.wallet)
@@ -2492,6 +2517,10 @@ def run_loop(client: ClobClient, wallet: str) -> None:
 
     log.info(f"Loop started. Balance: ${bankroll:.2f}  Positions loaded: {len(om.held_token_ids)}")
     pnl.snapshot_baseline(bankroll)
+    # Drain any stale Telegram updates so old /report commands don't double-fire
+    _poll_tg_commands()
+    # Send a startup report so any missed daily reports are covered immediately
+    pnl.maybe_report(om, bankroll, force=True)
     last_pos_sync = time.time()
 
     while True:
@@ -2640,6 +2669,12 @@ def run_loop(client: ClobClient, wallet: str) -> None:
             log.info("No orders this cycle.")
 
         pnl.maybe_report(om, bankroll)
+
+        # ── Telegram command listener (/report sends an instant P&L) ──────────
+        for cmd in _poll_tg_commands():
+            if cmd in ("/report", "/status", "/pnl"):
+                log.info(f"Telegram command received: {cmd} — sending instant report")
+                pnl.maybe_report(om, bankroll, force=True)
 
         # ── Adaptive sleep: 10s if any hourly market is within 30 min of expiry ──
         try:
