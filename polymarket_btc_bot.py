@@ -63,6 +63,7 @@ DRY_RUN               = False   # LIVE TRADING
 POLL_INTERVAL         = 15      # seconds between scans
 EDGE_BUFFER           = 0.03    # place limit this far below fair (3%)
 MIN_EDGE              = 0.03    # minimum net edge after fee (raised 2%→3% to match hourly quality bar)
+TRADE_DAILY_MARKETS   = False   # daily WR=45% (losing); paused until win-rate improves above 50%
 TAKER_FEE             = 0.02    # Polymarket taker fee on winnings
 KELLY_FRACTION        = 0.35    # 35% Kelly — more aggressive sizing
 MAX_BET_USDC          = 8.0     # hard cap per order — raised to let high-edge trades get full Kelly size
@@ -2475,8 +2476,8 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -
                  f"5min={five_min_s:+.3f} news={news_score:+.2f} tod={tod_mult:.2f}  "
                  f"{question[:40]}")
 
-        if consensus <= 0:
-            log.info(f"    Skip {asset} hourly: signals conflict (consensus={consensus}/6)")
+        if consensus < 2:
+            log.info(f"    Skip {asset} hourly: weak consensus ({consensus}/6 < 2 required)")
             continue
 
         available  = free_bankroll(bankroll, om)
@@ -2789,7 +2790,13 @@ def run_loop(client: ClobClient, wallet: str) -> None:
         cycle_orders  = 0
         all_markets:  list[dict] = []   # accumulated for arb scan (no re-fetch)
 
+        if not TRADE_DAILY_MARKETS:
+            log.info("Daily markets paused (TRADE_DAILY_MARKETS=False — daily WR 45%)")
+
         for asset, cfg in ASSETS.items():
+            if not TRADE_DAILY_MARKETS:
+                break  # skip the entire daily scan
+
             spot = get_price(cfg["coingecko_id"], cfg["binance_symbol"])
             if not spot:
                 log.warning(f"No price for {asset}, skipping")
