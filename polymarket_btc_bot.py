@@ -68,7 +68,7 @@ TAKER_FEE             = 0.02    # Polymarket taker fee on winnings
 KELLY_FRACTION        = 0.35    # 35% Kelly — more aggressive sizing
 MAX_BET_USDC          = 8.0     # hard cap per order — raised to let high-edge trades get full Kelly size
 TAKE_PROFIT           = 0.40    # exit when position up ≥40% from entry
-STOP_LOSS             = 0.20    # exit when position down ≥20% — tighter to exit before near-expiry collapse
+STOP_LOSS             = 0.30    # reverted 0.20→0.30: tight stop caused 61%→27% WR crash from normal market noise
 MIN_BET_USDC          = 0.20    # skip orders below this ($0.50 blocked all kelly bets on $30 bankroll)
 MIN_VOLUME            = 15_000  # raised 5k→15k: thin markets have poor price discovery
 TRADED_RESET_HOURS    = 6       # full reset every N hours
@@ -680,13 +680,42 @@ def scan_exit_positions(client: ClobClient, om: OrderManager, wallet: str = "") 
     """
     if DRY_RUN:
         return
+    now_ts = time.time()
     for token_id, entry in list(om.held_positions.items()):
         if entry <= 0:
             continue
-        if time.time() - om.recent_fill_ts.get(token_id, 0) < 900:
+
+        # ── Stale position cleanup ─────────────────────────────────────────
+        # Hourly markets that expired >30 min ago have already resolved on-chain.
+        # Remove from tracking so they stop blocking the position cap.
+        market_end = om.held_market_end.get(token_id, 0.0)
+        if market_end > 0 and now_ts > market_end + 1800:
+            log.info(f"  🧹 Purge expired position {token_id[:12]}… "
+                     f"(market ended {(now_ts - market_end)/60:.0f}m ago)")
+            om.held_positions.pop(token_id, None)
+            om.held_labels.pop(token_id, None)
+            om.held_market_end.pop(token_id, None)
+            om.peak_bid.pop(token_id, None)
+            om.partial_exit_done.discard(token_id)
+            continue
+
+        if now_ts - om.recent_fill_ts.get(token_id, 0) < 900:
             continue  # held <15 min — entry price may not be settled
         try:
             bid, ask, _, liquid = get_order_book(token_id)
+
+            # Near-zero positions held >2h are effectively worthless — purge them.
+            if bid < 0.03 and now_ts - om.recent_fill_ts.get(token_id, 0) > 7200:
+                log.info(f"  🧹 Purge near-zero position {token_id[:12]}… "
+                         f"(bid={bid:.3f}, held >{(now_ts - om.recent_fill_ts.get(token_id,0))/3600:.1f}h)")
+                _wr_tracker.record_exit(om.held_labels.get(token_id, ""), won=False)
+                om.held_positions.pop(token_id, None)
+                om.held_labels.pop(token_id, None)
+                om.held_market_end.pop(token_id, None)
+                om.peak_bid.pop(token_id, None)
+                om.partial_exit_done.discard(token_id)
+                continue
+
             if not liquid or bid < 0.05:
                 continue
             if (ask - bid) > 0.30:
@@ -703,11 +732,8 @@ def scan_exit_positions(client: ClobClient, om: OrderManager, wallet: str = "") 
             is_partial = token_id in om.partial_exit_done
 
             # ── Hold-to-expiry zone (hourly markets only) ─────────────────
-            # Within 10 min of expiry: selling costs taker fee + bid-ask spread
-            # for the same expected value as holding. Settlement is exact (no
-            # slippage) and fee-free — always better than selling early.
-            market_end = om.held_market_end.get(token_id, 0.0)
-            if is_hourly and market_end > 0 and (market_end - time.time()) < 600:
+            # Within 10 min of expiry: hold to settlement (no spread/fee cost).
+            if is_hourly and market_end > 0 and (market_end - now_ts) < 600:
                 log.debug(f"  Hold to expiry {token_id[:12]}…: <10m left, skip exit")
                 continue
 
