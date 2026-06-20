@@ -88,7 +88,7 @@ DRAWDOWN_WARN_PCT  = 0.20   # 20% from peak → halve Kelly + Telegram alert
 DRAWDOWN_PAUSE_PCT = 0.30   # 30% from peak → halt trading entirely
 
 # ── Rolling win-rate (dynamic Kelly) ──────────────────────────────────────────
-WINRATE_WINDOW     = 30     # look back over the last N resolved positions
+WINRATE_WINDOW     = 20     # look back over last 20 trades — faster adaptation than 30
 WINRATE_MIN_SAMPLE = 5      # need at least this many before adjusting Kelly
 
 # ── Exit tuning ────────────────────────────────────────────────────────────────
@@ -2276,7 +2276,7 @@ def compute_hourly_fair(binance_sym: str, spot: float = 0.0, mins_left: float = 
 
 MIN_HOURLY_VOLUME    = 10     # hourly markets are new each hour — volume is always tiny early
 MIN_HOURLY_MINS      = 15     # skip hourly markets with <15 min to expiry
-HOURLY_EDGE_BUFFER   = 0.010  # tighter than regular 3% — hourly fairs cluster near 50¢
+HOURLY_EDGE_BUFFER   = 0.005  # reduced 0.010→0.005 to improve 13% fill rate — closer to fair
 MAX_HOURLY_SPREAD    = 0.30   # require a real two-sided book (skip 0.01/0.99 empty shells)
 MIN_HOURLY_BID       = 0.05   # require a real bid — avoids adverse selection in dead books
 MIN_HOURLY_CONVICTION = 0.55  # require ≥55¢ fair before entering — no near-coinflip bets
@@ -2910,11 +2910,24 @@ def run_loop(client: ClobClient, wallet: str) -> None:
 
         pnl.maybe_report(om, bankroll)
 
-        # ── Telegram command listener (/report sends an instant P&L) ──────────
+        # ── Telegram command listener ────────────────────────────────────────
         for cmd in _poll_tg_commands():
             if cmd in ("/report", "/status", "/pnl"):
-                log.info(f"Telegram command received: {cmd} — sending instant report")
+                log.info(f"Telegram command: {cmd} — sending instant report")
                 pnl.maybe_report(om, bankroll, force=True)
+            elif cmd == "/reset":
+                # Clear win-rate history so Kelly exits survival mode.
+                # Use after a known-bad period (e.g. wrong stop-loss setting).
+                from collections import defaultdict, deque as _deque
+                _wr_tracker._history = defaultdict(lambda: _deque(maxlen=WINRATE_WINDOW))
+                try:
+                    import os as _os
+                    _os.remove(_STATE_FILE)
+                except Exception:
+                    pass
+                log.info("Win-rate history reset via /reset command")
+                tg("🔄 <b>Win-rate reset</b>\nHistory cleared — Kelly returns to base 0.35\n"
+                   "Bot will rebuild win-rate from next trades.")
 
         # ── Adaptive sleep: 10s if any hourly market is within 30 min of expiry ──
         try:
