@@ -581,12 +581,14 @@ class OrderManager:
                     log.warning(f"  Cancel {oid[:10]} failed: {e}")
 
     def cancel_aged(self, client: ClobClient) -> None:
-        """Cancel unfilled GTC orders older than MAX_ORDER_AGE_HOURS."""
+        """Cancel unfilled GTC orders older than MAX_ORDER_AGE_HOURS (30min for hourly)."""
         if DRY_RUN:
             return
-        cutoff = time.time() - MAX_ORDER_AGE_HOURS * 3600
+        now = time.time()
         for oid, tracked in list(self.orders.items()):
-            if tracked.placed_at < cutoff:
+            is_hourly = "hourly" in tracked.label.lower() or " et " in tracked.label.lower()
+            max_age   = 0.5 * 3600 if is_hourly else MAX_ORDER_AGE_HOURS * 3600
+            if now - tracked.placed_at > max_age:
                 age_h = (time.time() - tracked.placed_at) / 3600
                 log.info(f"  Cancelling aged order {oid[:10]} ({age_h:.1f}h old): {tracked.label[:30]}")
                 try:
@@ -686,8 +688,9 @@ def scan_exit_positions(client: ClobClient, om: OrderManager, wallet: str = "") 
             continue
 
         # ── Stale position cleanup ─────────────────────────────────────────
-        # Hourly markets that expired >30 min ago have already resolved on-chain.
-        # Remove from tracking so they stop blocking the position cap.
+        # Purge silently — do NOT record as win/loss. These are legacy positions
+        # from previous sessions or expired markets; counting them as losses
+        # contaminates the win-rate tracker with phantom data.
         market_end = om.held_market_end.get(token_id, 0.0)
         if market_end > 0 and now_ts > market_end + 1800:
             log.info(f"  🧹 Purge expired position {token_id[:12]}… "
@@ -704,11 +707,10 @@ def scan_exit_positions(client: ClobClient, om: OrderManager, wallet: str = "") 
         try:
             bid, ask, _, liquid = get_order_book(token_id)
 
-            # Near-zero positions held >2h are effectively worthless — purge them.
+            # Near-zero bids held >2h: purge silently (not a current-session trade).
             if bid < 0.03 and now_ts - om.recent_fill_ts.get(token_id, 0) > 7200:
                 log.info(f"  🧹 Purge near-zero position {token_id[:12]}… "
-                         f"(bid={bid:.3f}, held >{(now_ts - om.recent_fill_ts.get(token_id,0))/3600:.1f}h)")
-                _wr_tracker.record_exit(om.held_labels.get(token_id, ""), won=False)
+                         f"(bid={bid:.3f}) — not counting as loss")
                 om.held_positions.pop(token_id, None)
                 om.held_labels.pop(token_id, None)
                 om.held_market_end.pop(token_id, None)
@@ -1700,7 +1702,7 @@ def process_market(client: ClobClient, om: OrderManager,
     if fair >= 0.50:
         # BUY YES — limit below our fair, but at least 1 tick above best bid
         limit    = round(max(bid + 0.01, fair - EDGE_BUFFER, 0.02), 2)
-        limit    = min(limit, ask - 0.01)  # never cross the spread
+        limit    = min(limit, ask)  # allow taker fill when fair is above ask
         net_edge = fair * (1 - TAKER_FEE) - limit
         result.update(limit=limit, net_edge=net_edge, side="YES")
         if net_edge >= MIN_EDGE and not om.has_open_order(token_yes):
@@ -2524,7 +2526,7 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -
                     log.debug(f"    Skip hourly UP: model={fair_up:.2f} book={book_mid:.2f}")
                 else:
                     limit    = round(max(bid + 0.01, fair_up - HOURLY_EDGE_BUFFER, 0.02), 2)
-                    limit    = min(limit, ask - 0.01)
+                    limit    = min(limit, ask)  # allow taker fill when fair > ask
                     net_edge = fair_up * (1 - TAKER_FEE) - limit
                     label    = f"{asset} UP {time_str} ET (hourly)"
                     if net_edge >= MIN_HOURLY_EDGE and not om.has_open_order(token_up):
