@@ -60,7 +60,7 @@ TICK_SIZE  = "0.01"
 
 # ── Bot config ─────────────────────────────────────────────────────────────────
 DRY_RUN               = False   # LIVE TRADING
-POLL_INTERVAL         = 15      # seconds between scans
+POLL_INTERVAL         = 10      # seconds between scans — faster stop-loss execution
 EDGE_BUFFER           = 0.03    # place limit this far below fair (3%)
 MIN_EDGE              = 0.03    # minimum net edge after fee (raised 2%→3% to match hourly quality bar)
 TRADE_DAILY_MARKETS   = False   # daily WR=45% (losing); paused until win-rate improves above 50%
@@ -806,6 +806,7 @@ def scan_exit_positions(client: ClobClient, om: OrderManager, wallet: str = "") 
                    f"P&L: <b>{pnl_usdc:+.2f} USDC</b>  ({gain*100:+.1f}%)\n"
                    f"{label or token_id[:16]}")
                 _wr_tracker.record_exit(label, won=(gain >= 0))
+                record_realized_pnl(pnl_usdc, won=(gain >= 0))
                 if sell_all:
                     om.held_positions.pop(token_id, None)
                     om.held_labels.pop(token_id, None)
@@ -1297,17 +1298,36 @@ _loss_cooldown: dict[str, float] = {}
 # Lost on new deploys (code pushes) — add a Railway Volume for full persistence.
 _STATE_FILE = os.getenv("STATE_FILE", "bot_state.json")
 
+# Cumulative realized P&L across all sessions (persisted to state file)
+_total_realized_pnl: float = 0.0
+_total_wins:  int = 0
+_total_losses: int = 0
+
+
+def record_realized_pnl(pnl_usdc: float, won: bool) -> None:
+    """Call on every exit with the USDC profit/loss of that trade."""
+    global _total_realized_pnl, _total_wins, _total_losses
+    _total_realized_pnl += pnl_usdc
+    if won:
+        _total_wins  += 1
+    else:
+        _total_losses += 1
+    _save_state()
+
 
 def _save_state() -> None:
-    """Write win-rate history, loss cooldowns and DD peak to disk."""
+    """Write win-rate history, loss cooldowns, DD peak and cumulative P&L to disk."""
     try:
         now = time.time()
         data = {
-            "winrate":  {k: list(v) for k, v in _wr_tracker._history.items()},
-            "cooldown": {k: v for k, v in _loss_cooldown.items()
-                         if now - v < LOSS_COOLDOWN_HOURS * 3600},
-            "dd_peak":  _dd_guard.peak,
-            "saved_at": now,
+            "winrate":      {k: list(v) for k, v in _wr_tracker._history.items()},
+            "cooldown":     {k: v for k, v in _loss_cooldown.items()
+                             if now - v < LOSS_COOLDOWN_HOURS * 3600},
+            "dd_peak":      _dd_guard.peak,
+            "total_pnl":    _total_realized_pnl,
+            "total_wins":   _total_wins,
+            "total_losses": _total_losses,
+            "saved_at":     now,
         }
         with open(_STATE_FILE, "w") as fh:
             json.dump(data, fh)
@@ -1316,7 +1336,8 @@ def _save_state() -> None:
 
 
 def _load_state() -> None:
-    """Restore win-rate history, loss cooldowns and DD peak from disk."""
+    """Restore win-rate history, loss cooldowns, DD peak and cumulative P&L from disk."""
+    global _total_realized_pnl, _total_wins, _total_losses
     try:
         with open(_STATE_FILE) as fh:
             data = json.load(fh)
@@ -1333,10 +1354,16 @@ def _load_state() -> None:
         peak = float(data.get("dd_peak", 0.0))
         if peak > 0:
             _dd_guard.peak = peak
+        # Cumulative P&L
+        _total_realized_pnl = float(data.get("total_pnl",    0.0))
+        _total_wins          = int(data.get("total_wins",   0))
+        _total_losses        = int(data.get("total_losses", 0))
         age_h = (now - float(data.get("saved_at", now))) / 3600
+        total_trades = _total_wins + _total_losses
         log.info(f"  🔄 State restored (saved {age_h:.1f}h ago): "
                  f"win-rate={_wr_tracker.summary()}  "
-                 f"cooldowns={len(_loss_cooldown)}  dd_peak=${_dd_guard.peak:.2f}")
+                 f"cooldowns={len(_loss_cooldown)}  dd_peak=${_dd_guard.peak:.2f}  "
+                 f"all-time P&L={_total_realized_pnl:+.2f} USDC ({total_trades} trades)")
     except FileNotFoundError:
         log.info("  No saved state — starting fresh")
     except Exception as e:
@@ -2709,11 +2736,15 @@ class PnL:
         # Positive = above peak (good), negative = drawdown (guard may intervene).
         cash_vs_peak = ((bankroll - _dd_guard.peak) / _dd_guard.peak * 100) if _dd_guard.peak > 0 else 0.0
         dd_label = f"⚠️ {abs(cash_vs_peak):.1f}% drawdown" if cash_vs_peak < -DRAWDOWN_WARN_PCT * 100 else f"{cash_vs_peak:+.1f}% vs peak cash"
+        total_trades = _total_wins + _total_losses
+        alltime_wr   = f"{_total_wins/total_trades*100:.0f}%" if total_trades else "n/a"
         tg(f"{emoji} <b>DAILY P&L REPORT</b>\n"
            f"━━━━━━━━━━━━━━━━━\n"
            f"Portfolio: <b>${portfolio:.2f}</b>  ({change:+.2f} / {pct:+.1f}%)\n"
            f"Cash: ${bankroll:.2f}  ·  Positions: ${pos_value:.2f}\n"
            f"Peak cash: ${_dd_guard.peak:.2f}  ({dd_label})\n"
+           f"━━━━━━━━━━━━━━━━━\n"
+           f"All-time P&L: <b>{_total_realized_pnl:+.2f} USDC</b>  ({alltime_wr} WR, {total_trades} trades)\n"
            f"━━━━━━━━━━━━━━━━━\n"
            f"24h orders: {orders}  ·  24h fills: {fills}\n"
            f"Open positions: {len(om.held_positions)}\n"
@@ -2930,6 +2961,27 @@ def run_loop(client: ClobClient, wallet: str) -> None:
                 log.info("Win-rate history reset via /reset command")
                 tg("🔄 <b>Win-rate reset</b>\nHistory cleared — Kelly returns to base 0.35\n"
                    "Bot will rebuild win-rate from next trades.")
+            elif cmd == "/stats":
+                # All-time performance breakdown
+                total = _total_wins + _total_losses
+                fill_rate = (om.fill_count / om.order_count * 100) if om.order_count else 0.0
+                wr_by_type = "\n".join(
+                    f"  {mt}: {sum(v)/len(v)*100:.0f}% ({sum(v)}W/{len(v)-sum(v)}L)"
+                    for mt, v in _wr_tracker._history.items() if v
+                ) or "  No data yet"
+                tg(f"📊 <b>BOT STATS</b>\n"
+                   f"━━━━━━━━━━━━━━━━━\n"
+                   f"All-time P&L: <b>{_total_realized_pnl:+.2f} USDC</b>\n"
+                   f"Total trades: {total}  ({_total_wins}W / {_total_losses}L)\n"
+                   f"All-time WR: {_total_wins/total*100:.0f}%" if total else
+                   f"📊 <b>BOT STATS</b>\nNo trades recorded yet." + "\n"
+                   f"━━━━━━━━━━━━━━━━━\n"
+                   f"Recent WR by type:\n{wr_by_type}\n"
+                   f"━━━━━━━━━━━━━━━━━\n"
+                   f"Fill rate: {fill_rate:.0f}% ({om.fill_count}/{om.order_count})\n"
+                   f"Open positions: {len(om.held_positions)}\n"
+                   f"Kelly: {_effective_kelly:.4f}")
+                log.info("Telegram command: /stats — sent stats")
 
         # ── Adaptive sleep: 10s if any hourly market is within 30 min of expiry ──
         try:
