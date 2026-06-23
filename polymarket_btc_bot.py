@@ -1373,9 +1373,9 @@ def _load_state() -> None:
 def _cooldown_key(label: str) -> str | None:
     """Extract 'ASSET_DIR' key from a label like 'BTC UP 2pm ET (hourly)'."""
     u = label.upper()
-    for asset in ("BTC", "ETH", "SOL", "XRP", "HYPE"):
+    for asset in HOURLY_ASSETS:  # all 12 assets
         if asset in u:
-            if " UP " in u or u.endswith("UP") or "(HOURLY)" in u and "UP" in u:
+            if " UP " in u or u.endswith("UP") or ("(HOURLY)" in u and "UP" in u):
                 return f"{asset}_UP"
             if " DOWN " in u or u.endswith("DOWN"):
                 return f"{asset}_DOWN"
@@ -1751,7 +1751,7 @@ def process_market(client: ClobClient, om: OrderManager,
         fair_no  = 1 - fair
         limit    = round(max(bid_no + 0.01, fair_no - EDGE_BUFFER, 0.02), 2)
         if liquid_no:
-            limit = min(limit, ask_no - 0.01)
+            limit = min(limit, ask_no)  # allow taker fill when fair > ask
         net_edge = fair_no * (1 - TAKER_FEE) - limit
         result.update(limit=limit, net_edge=net_edge, side="NO")
         if net_edge >= MIN_EDGE and token_no and not om.has_open_order(token_no):
@@ -2407,16 +2407,22 @@ def _collect_hourly_markets() -> list[tuple[dict, str, str]]:
     return results
 
 
-def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -> int:
+def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float,
+                        hourly_markets: list = None) -> tuple[int, list]:
     """
-    Scan current + next-3-hour up/down markets for BTC, ETH, SOL, XRP, HYPE, DOGE, AVAX, LINK.
-    Returns number of orders placed.
+    Scan current + next-3-hour up/down markets for all hourly assets.
+    Returns (orders_placed, hourly_market_list) — caller reuses the list to avoid
+    a second _collect_hourly_markets() call for stale-fair cancellation.
+    Pass hourly_markets to skip collection (use cached list from caller).
     """
     orders_placed = 0
     seen_tokens: set = set()
     spot_map: dict[str, float] = {}   # cache spot per asset for this scan
 
-    for m, asset, binance_sym in _collect_hourly_markets():
+    if hourly_markets is None:
+        hourly_markets = _collect_hourly_markets()
+
+    for m, asset, binance_sym in hourly_markets:
         question = m.get("question", "")
 
         # ── Volume gate (lower than weekly markets) ────────────────────────
@@ -2579,7 +2585,7 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -
                     log.debug(f"    Skip hourly DOWN: model={fair_down:.2f} book={book_mid_dn:.2f}")
                 else:
                     limit    = round(max(bid_dn + 0.01, fair_down - HOURLY_EDGE_BUFFER, 0.02), 2)
-                    limit    = min(limit, ask_dn - 0.01)
+                    limit    = min(limit, ask_dn)  # allow taker fill when fair > ask
                     net_edge = fair_down * (1 - TAKER_FEE) - limit
                     label    = f"{asset} DOWN {time_str} ET (hourly)"
                     if net_edge >= MIN_HOURLY_EDGE and not om.has_open_order(token_down):
@@ -2593,7 +2599,7 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float) -
         else:
             log.debug(f"    Skip hourly {asset}: no conviction (fair_up={fair_up:.3f} fair_dn={fair_down:.3f})")
 
-    return orders_placed
+    return orders_placed, hourly_markets
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2913,17 +2919,15 @@ def run_loop(client: ClobClient, wallet: str) -> None:
 
         # ── Hourly up/down markets (momentum-based, no strike) ────────────────
         log.info(f"\n{'─'*24} HOURLY MARKETS {'─'*24}")
+        hourly_list: list = []
         try:
-            hourly_placed = scan_hourly_markets(client, om, bankroll)
+            hourly_placed, hourly_list = scan_hourly_markets(client, om, bankroll)
             cycle_orders += hourly_placed
             if hourly_placed == 0:
                 log.info("  No hourly edge this cycle.")
-            # Register hourly fairs so stale hourly orders get cancelled too.
-            # Only fill in tokens NOT already written by scan_hourly_markets —
-            # that call uses the correct blended (option-weighted) fair; calling
-            # compute_hourly_fair() without spot/mins_left here would overwrite
-            # with a momentum-only fair and incorrectly cancel near-expiry orders.
-            for m, asset, bsym in _collect_hourly_markets():
+            # Reuse the already-fetched list to register stale-cancel fairs —
+            # avoids a second _collect_hourly_markets() call (doubles Gamma API hits).
+            for m, asset, bsym in hourly_list:
                 raw = m.get("clobTokenIds") or []
                 if isinstance(raw, str):
                     try: raw = json.loads(raw)
@@ -2963,18 +2967,21 @@ def run_loop(client: ClobClient, wallet: str) -> None:
                    "Bot will rebuild win-rate from next trades.")
             elif cmd == "/stats":
                 # All-time performance breakdown
-                total = _total_wins + _total_losses
+                total     = _total_wins + _total_losses
                 fill_rate = (om.fill_count / om.order_count * 100) if om.order_count else 0.0
                 wr_by_type = "\n".join(
                     f"  {mt}: {sum(v)/len(v)*100:.0f}% ({sum(v)}W/{len(v)-sum(v)}L)"
                     for mt, v in _wr_tracker._history.items() if v
                 ) or "  No data yet"
+                alltime_line = (
+                    f"All-time P&L: <b>{_total_realized_pnl:+.2f} USDC</b>\n"
+                    f"Total trades: {total}  ({_total_wins}W / {_total_losses}L)\n"
+                    f"All-time WR: {_total_wins/total*100:.0f}%"
+                    if total else "All-time P&L: no trades yet"
+                )
                 tg(f"📊 <b>BOT STATS</b>\n"
                    f"━━━━━━━━━━━━━━━━━\n"
-                   f"All-time P&L: <b>{_total_realized_pnl:+.2f} USDC</b>\n"
-                   f"Total trades: {total}  ({_total_wins}W / {_total_losses}L)\n"
-                   f"All-time WR: {_total_wins/total*100:.0f}%" if total else
-                   f"📊 <b>BOT STATS</b>\nNo trades recorded yet." + "\n"
+                   f"{alltime_line}\n"
                    f"━━━━━━━━━━━━━━━━━\n"
                    f"Recent WR by type:\n{wr_by_type}\n"
                    f"━━━━━━━━━━━━━━━━━\n"
@@ -2987,7 +2994,7 @@ def run_loop(client: ClobClient, wallet: str) -> None:
         try:
             near_expiry = any(
                 _hourly_mins_remaining(m) < 30
-                for m, _, _ in _collect_hourly_markets()
+                for m, _, _ in hourly_list  # reuse already-fetched list
             )
         except Exception:
             near_expiry = False
