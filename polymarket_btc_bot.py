@@ -293,7 +293,7 @@ _drift_cache: dict = {}
 _book_cache:  dict = {}
 _imb_cache:   dict = {}   # Binance book-imbalance cache
 SLUG_TTL  = 300
-BOOK_TTL  = 25    # longer than POLL_INTERVAL so cache survives across cycles
+BOOK_TTL  = 8     # shorter than POLL_INTERVAL (10s) so each cycle sees fresh prices
 SLUG_MAX  = 2000  # evict oldest entries beyond this to prevent memory growth
 IMB_TTL   = 60    # imbalance re-fetched once per minute
 
@@ -2990,15 +2990,15 @@ def run_loop(client: ClobClient, wallet: str) -> None:
                    f"Kelly: {_effective_kelly:.4f}")
                 log.info("Telegram command: /stats — sent stats")
 
-        # ── Adaptive sleep: 10s if any hourly market is within 30 min of expiry ──
+        # ── Adaptive sleep: 5s sprint when any hourly market is within 10 min of expiry ──
         try:
             near_expiry = any(
-                _hourly_mins_remaining(m) < 30
+                _hourly_mins_remaining(m) < 10
                 for m, _, _ in hourly_list  # reuse already-fetched list
             )
         except Exception:
             near_expiry = False
-        effective_interval = 10 if near_expiry else POLL_INTERVAL
+        effective_interval = 5 if near_expiry else POLL_INTERVAL
 
         elapsed   = time.time() - cycle_start
         sleep_for = max(1.0, effective_interval - elapsed)
