@@ -65,7 +65,7 @@ EDGE_BUFFER           = 0.03    # place limit this far below fair (3%)
 MIN_EDGE              = 0.03    # minimum net edge after fee (raised 2%→3% to match hourly quality bar)
 TRADE_DAILY_MARKETS   = False   # daily WR=45% (losing); paused until win-rate improves above 50%
 TAKER_FEE             = 0.02    # Polymarket taker fee on winnings
-KELLY_FRACTION        = 0.35    # 35% Kelly — more aggressive sizing
+KELLY_FRACTION        = 0.45    # 45% Kelly — aggressive but survives bad streaks
 MAX_BET_USDC          = 8.0     # hard cap per order — raised to let high-edge trades get full Kelly size
 TAKE_PROFIT           = 0.40    # exit when position up ≥40% from entry
 STOP_LOSS             = 0.30    # reverted 0.20→0.30: tight stop caused 61%→27% WR crash from normal market noise
@@ -2584,7 +2584,7 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float,
                     if (net_edge >= MIN_HOURLY_EDGE
                             and not om.has_open_order(token_up)
                             and not om.already_holds(token_up)):
-                        dyn_max_h = min(6.0, bankroll * 0.05) * tod_mult * consensus_mult
+                        dyn_max_h = min(8.0, bankroll * 0.07) * tod_mult * consensus_mult
                         size = kelly_buy(fair_up, limit, available,
                                          mtype="hourly", max_bet=dyn_max_h)
                         if size >= MIN_BET_USDC:
@@ -2612,7 +2612,7 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float,
                     if (net_edge >= MIN_HOURLY_EDGE
                             and not om.has_open_order(token_down)
                             and not om.already_holds(token_down)):
-                        dyn_max_h = min(6.0, bankroll * 0.05) * tod_mult * consensus_mult
+                        dyn_max_h = min(8.0, bankroll * 0.07) * tod_mult * consensus_mult
                         size = kelly_buy(fair_down, limit, available,
                                          mtype="hourly", max_bet=dyn_max_h)
                         if size >= MIN_BET_USDC:
