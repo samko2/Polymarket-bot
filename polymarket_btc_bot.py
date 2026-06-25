@@ -523,7 +523,11 @@ class OrderManager:
             open_orders = client.get_open_orders() or []
             open_ids    = {o.get("id") or o.get("orderID") for o in open_orders}
             open_tokens = {o.get("asset_id") for o in open_orders if o.get("asset_id")}
-            self.open_token_ids = open_tokens
+            # Only replace open_token_ids when the API returns a non-empty order list.
+            # An empty response during a network hiccup would otherwise clear the set,
+            # making has_open_order() return False and causing duplicate orders.
+            if open_orders:
+                self.open_token_ids = open_tokens
 
             for oid in [x for x in self.orders if x not in open_ids]:
                 tracked = self.orders.pop(oid)
@@ -1732,7 +1736,9 @@ def process_market(client: ClobClient, om: OrderManager,
         limit    = min(limit, ask)  # allow taker fill when fair is above ask
         net_edge = fair * (1 - TAKER_FEE) - limit
         result.update(limit=limit, net_edge=net_edge, side="YES")
-        if net_edge >= MIN_EDGE and not om.has_open_order(token_yes):
+        if (net_edge >= MIN_EDGE
+                and not om.has_open_order(token_yes)
+                and not om.already_holds(token_yes)):
             size = kelly_buy(fair, limit, available, mtype="daily", max_bet=dyn_max)
             if size >= MIN_BET_USDC:
                 if place_order(client, om, token_yes, limit, size, fair, label):
@@ -1754,7 +1760,9 @@ def process_market(client: ClobClient, om: OrderManager,
             limit = min(limit, ask_no)  # allow taker fill when fair > ask
         net_edge = fair_no * (1 - TAKER_FEE) - limit
         result.update(limit=limit, net_edge=net_edge, side="NO")
-        if net_edge >= MIN_EDGE and token_no and not om.has_open_order(token_no):
+        if (net_edge >= MIN_EDGE and token_no
+                and not om.has_open_order(token_no)
+                and not om.already_holds(token_no)):
             size = kelly_buy(fair_no, limit, available, mtype="daily", max_bet=dyn_max)
             if size >= MIN_BET_USDC:
                 if place_order(client, om, token_no, limit, size, fair_no, f"{label} NO"):
@@ -2562,7 +2570,9 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float,
                     limit    = min(limit, ask)  # allow taker fill when fair > ask
                     net_edge = fair_up * (1 - TAKER_FEE) - limit
                     label    = f"{asset} UP {time_str} ET (hourly)"
-                    if net_edge >= MIN_HOURLY_EDGE and not om.has_open_order(token_up):
+                    if (net_edge >= MIN_HOURLY_EDGE
+                            and not om.has_open_order(token_up)
+                            and not om.already_holds(token_up)):
                         dyn_max_h = min(6.0, bankroll * 0.05) * tod_mult * consensus_mult
                         size = kelly_buy(fair_up, limit, available,
                                          mtype="hourly", max_bet=dyn_max_h)
@@ -2588,7 +2598,9 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float,
                     limit    = min(limit, ask_dn)  # allow taker fill when fair > ask
                     net_edge = fair_down * (1 - TAKER_FEE) - limit
                     label    = f"{asset} DOWN {time_str} ET (hourly)"
-                    if net_edge >= MIN_HOURLY_EDGE and not om.has_open_order(token_down):
+                    if (net_edge >= MIN_HOURLY_EDGE
+                            and not om.has_open_order(token_down)
+                            and not om.already_holds(token_down)):
                         dyn_max_h = min(6.0, bankroll * 0.05) * tod_mult * consensus_mult
                         size = kelly_buy(fair_down, limit, available,
                                          mtype="hourly", max_bet=dyn_max_h)
