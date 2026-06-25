@@ -284,6 +284,16 @@ ASSETS = {
         "slugs":          [],
         "end_date": datetime(2026, 12, 31, 23, 59, tzinfo=timezone.utc),
     },
+    "BNB": {
+        "vol":            0.65,
+        "drift":          0.15,
+        "binance_symbol": "BNB",
+        "coingecko_id":   "binancecoin",
+        "keywords":       ["bnb", "binance coin"],
+        "daily_names":    ["bnb", "binance coin"],
+        "slugs":          [],
+        "end_date": datetime(2026, 12, 31, 23, 59, tzinfo=timezone.utc),
+    },
 }
 
 # ── Caches ─────────────────────────────────────────────────────────────────────
@@ -1789,6 +1799,7 @@ HOURLY_ASSETS = {
     "PEPE": {"slug_name": "pepe",         "binance": "PEPE"},
     "ADA":  {"slug_name": "cardano",      "binance": "ADA"},
     "TON":  {"slug_name": "toncoin",      "binance": "TON"},
+    "BNB":  {"slug_name": "bnb",          "binance": "BNB"},
 }
 
 
