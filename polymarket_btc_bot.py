@@ -1327,6 +1327,10 @@ class WinRateTracker:
         lbl = (label or "").lower()
         if "hourly" in lbl or " et " in lbl:
             return "hourly"
+        if "pol arb" in lbl or ("pol " in lbl and "arb" in lbl):
+            return "arb"
+        if lbl.startswith("pol "):
+            return "politics"
         if "arb" in lbl:
             return "arb"
         return "daily"
@@ -1361,7 +1365,7 @@ class WinRateTracker:
 
     def summary(self) -> str:
         parts = []
-        for mtype in ("hourly", "daily", "arb"):
+        for mtype in ("hourly", "daily", "politics", "arb"):
             h = self._history[mtype]
             if h:
                 wr = sum(h) / len(h)
@@ -1460,7 +1464,7 @@ def _load_state() -> None:
 def _cooldown_key(label: str) -> str | None:
     """Extract 'ASSET_DIR' key from a label like 'BTC UP 2pm ET (hourly)'."""
     u = label.upper()
-    for asset in HOURLY_ASSETS:  # all 12 assets
+    for asset in HOURLY_ASSETS:  # all 18 assets
         if asset in u:
             if " UP " in u or u.endswith("UP") or ("(HOURLY)" in u and "UP" in u):
                 return f"{asset}_UP"
@@ -2914,7 +2918,7 @@ def scan_politics_markets(client: ClobClient, om: OrderManager, bankroll: float)
                 label_n  = f"POL ARB NO:  {m.get('question','')[:35]}"
                 ok_y     = place_order(client, om, token_yes, ask_y, size, mid_y, label_y)
                 ok_n     = place_order(client, om, token_no,  ask_n, size, mid_n, label_n)
-                if ok_y or ok_n:
+                if ok_y and ok_n:
                     placed += 1
                     log.info(f"  ✅ Politics arb profit={arb_profit:.3f}: "
                              f"{m.get('question','')[:50]}")
