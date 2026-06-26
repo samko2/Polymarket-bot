@@ -67,6 +67,7 @@ TRADE_DAILY_MARKETS   = False   # daily WR=45% (losing); paused until win-rate i
 TAKER_FEE             = 0.02    # Polymarket taker fee on winnings
 KELLY_FRACTION        = 0.45    # 45% Kelly — aggressive but survives bad streaks
 MAX_BET_USDC          = 8.0     # hard cap per order — raised to let high-edge trades get full Kelly size
+MAX_MARKET_EXPOSURE   = 10.0   # hard cap total USDC deployed in any single market token (all entries combined)
 TAKE_PROFIT           = 0.40    # exit when position up ≥40% from entry
 STOP_LOSS             = 0.30    # reverted 0.20→0.30: tight stop caused 61%→27% WR crash from normal market noise
 MIN_BET_USDC          = 0.20    # skip orders below this ($0.50 blocked all kelly bets on $30 bankroll)
@@ -477,6 +478,7 @@ class OrderManager:
         self.fills_usdc:      float = 0.0
         self.fill_count:      int   = 0
         self.order_count:     int   = 0
+        self.market_exposure: dict[str, float] = {}  # token_id → total USDC deployed
 
     def sync_positions(self, wallet: str) -> None:
         """
@@ -514,6 +516,13 @@ class OrderManager:
                                               market_end=market_end)
         self.open_token_ids.add(token_id)
         self.order_count      += 1
+        self.market_exposure[token_id] = self.market_exposure.get(token_id, 0.0) + size_usdc
+
+    def market_exposure_usdc(self, token_id: str) -> float:
+        return self.market_exposure.get(token_id, 0.0)
+
+    def clear_exposure(self, token_id: str) -> None:
+        self.market_exposure.pop(token_id, None)
 
     def has_open_order(self, token_id: str) -> bool:
         return token_id in self.open_token_ids
@@ -827,6 +836,7 @@ def scan_exit_positions(client: ClobClient, om: OrderManager, wallet: str = "") 
                     om.held_market_end.pop(token_id, None)
                     om.peak_bid.pop(token_id, None)
                     om.partial_exit_done.discard(token_id)
+                    om.clear_exposure(token_id)
                     _pos_size_cache.pop(token_id, None)
                     if "stop-loss" in reason:
                         ck = _cooldown_key(label)
@@ -1748,7 +1758,8 @@ def process_market(client: ClobClient, om: OrderManager,
         result.update(limit=limit, net_edge=net_edge, side="YES")
         if (net_edge >= MIN_EDGE
                 and not om.has_open_order(token_yes)
-                and not om.already_holds(token_yes)):
+                and not om.already_holds(token_yes)
+                and om.market_exposure_usdc(token_yes) < MAX_MARKET_EXPOSURE):
             size = kelly_buy(fair, limit, available, mtype="daily", max_bet=dyn_max)
             if size >= MIN_BET_USDC:
                 if place_order(client, om, token_yes, limit, size, fair, label):
@@ -1772,7 +1783,8 @@ def process_market(client: ClobClient, om: OrderManager,
         result.update(limit=limit, net_edge=net_edge, side="NO")
         if (net_edge >= MIN_EDGE and token_no
                 and not om.has_open_order(token_no)
-                and not om.already_holds(token_no)):
+                and not om.already_holds(token_no)
+                and om.market_exposure_usdc(token_no) < MAX_MARKET_EXPOSURE):
             size = kelly_buy(fair_no, limit, available, mtype="daily", max_bet=dyn_max)
             if size >= MIN_BET_USDC:
                 if place_order(client, om, token_no, limit, size, fair_no, f"{label} NO"):
@@ -2583,7 +2595,8 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float,
                     label    = f"{asset} UP {time_str} ET (hourly)"
                     if (net_edge >= MIN_HOURLY_EDGE
                             and not om.has_open_order(token_up)
-                            and not om.already_holds(token_up)):
+                            and not om.already_holds(token_up)
+                            and om.market_exposure_usdc(token_up) < MAX_MARKET_EXPOSURE):
                         dyn_max_h = min(8.0, bankroll * 0.07) * tod_mult * consensus_mult
                         size = kelly_buy(fair_up, limit, available,
                                          mtype="hourly", max_bet=dyn_max_h)
@@ -2611,7 +2624,8 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float,
                     label    = f"{asset} DOWN {time_str} ET (hourly)"
                     if (net_edge >= MIN_HOURLY_EDGE
                             and not om.has_open_order(token_down)
-                            and not om.already_holds(token_down)):
+                            and not om.already_holds(token_down)
+                            and om.market_exposure_usdc(token_down) < MAX_MARKET_EXPOSURE):
                         dyn_max_h = min(8.0, bankroll * 0.07) * tod_mult * consensus_mult
                         size = kelly_buy(fair_down, limit, available,
                                          mtype="hourly", max_bet=dyn_max_h)
