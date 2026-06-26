@@ -2339,7 +2339,7 @@ MIN_HOURLY_MINS      = 15     # skip hourly markets with <15 min to expiry
 HOURLY_EDGE_BUFFER   = 0.005  # reduced 0.010→0.005 to improve 13% fill rate — closer to fair
 MAX_HOURLY_SPREAD    = 0.30   # require a real two-sided book (skip 0.01/0.99 empty shells)
 MIN_HOURLY_BID       = 0.05   # require a real bid — avoids adverse selection in dead books
-MIN_HOURLY_CONVICTION = 0.55  # require ≥55¢ fair before entering — no near-coinflip bets
+MIN_HOURLY_CONVICTION = 0.58  # require ≥58¢ fair — filters near-coinflip bets and reduces overtrading
 MIN_HOURLY_EDGE      = 0.025  # consensus gate handles quality; lower bar finds more opportunities
 MAX_HOURLY_BET_USDC  = 3.0    # cap hourly bets lower than regular $5 max
 NEWS_FAIR_NUDGE  = 0.03   # max ±3¢ shift on hourly fair from news sentiment
@@ -2510,18 +2510,20 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float,
         fair_up, fair_down = compute_hourly_fair(binance_sym, spot, mins_left)
 
         # Cross-asset confirmation: count how many other assets' 1m momentum
-        # agrees with the current direction. 2+ agreeing assets = risk-on/off
-        # move, which is a real signal. Nudge fair by 2¢ per confirming asset.
+        # agrees with the current direction. Only applied when the model already
+        # has conviction — cross-asset cannot manufacture a signal from nothing.
+        # Capped at 2 confirmations (0.04 max boost) to prevent a broad crypto
+        # move from forcing entries on every asset simultaneously.
         if fair_up >= MIN_HOURLY_CONVICTION or fair_down >= MIN_HOURLY_CONVICTION:
             direction_up = fair_up >= fair_down
-            confirmations = sum(
+            confirmations = min(2, sum(
                 1 for oa, ocfg in HOURLY_ASSETS.items()
                 if oa != asset
                 and abs(_hourly_momentum(ocfg["binance"])) > 0.03
                 and (_hourly_momentum(ocfg["binance"]) > 0) == direction_up
-            )
+            ))
             if confirmations >= 2:
-                boost = 0.02 * confirmations
+                boost = 0.02 * confirmations   # max 0.04 boost
                 if direction_up:
                     fair_up   = min(0.75, fair_up   + boost)
                     fair_down = round(1 - fair_up,  4)
@@ -2537,9 +2539,9 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float,
         time_str = tm.group(0) if tm else "?"
 
         # ── Signal consensus gate ──────────────────────────────────────────
-        # 5 signals scored +1/-1/0 based on agreement with dominant direction.
-        # Range: [-5, +5]. Require consensus ≥ 1 to enter.
-        # Size up: 1.2× at 3 agreeing, 1.4× at 4, 1.6× at all 5.
+        # 6 signals scored +1/-1/0 based on agreement with dominant direction.
+        # Range: [-6, +6]. Require net ≥ 2 to enter (majority agreement).
+        # Size up: +0.20× per signal above 2 (max 1.8× at all 6 agreeing).
         direction_up = fair_up >= fair_down
         mom_s      = _hourly_momentum(binance_sym)
         imb_s      = _book_imbalance(binance_sym)
@@ -2827,6 +2829,7 @@ def run_loop(client: ClobClient, wallet: str) -> None:
     log.info(f"Loop started. Balance: ${bankroll:.2f}  Positions loaded: {len(om.held_token_ids)}")
     _load_state()   # restore win-rate, cooldowns and DD peak from previous session
     pnl.snapshot_baseline(bankroll)
+    session_start_bankroll = bankroll   # track session-start balance for intra-session loss guard
     # Drain any stale Telegram updates so old /report commands don't double-fire
     _poll_tg_commands()
     # Send a startup report so any missed daily reports are covered immediately
@@ -2856,15 +2859,26 @@ def run_loop(client: ClobClient, wallet: str) -> None:
         _effective_kelly = round(KELLY_FRACTION * dd_mult * wr_mult, 4)
 
         # ── Auto-reset contaminated win-rate ───────────────────────────────────
-        # If every sample in the last window is a loss (0% WR with 10+ trades),
+        # If every sample across all market types is a loss (0% WR with 10+ trades),
         # the data was almost certainly poisoned by the phantom-loss bug.
         # Auto-clear so Kelly recovers without needing a manual /reset.
-        _all_hist = list(_wr_tracker._history.get("all", []))
-        if len(_all_hist) >= 10 and sum(_all_hist) == 0:
+        _all_outcomes = [v for hist in _wr_tracker._history.values() for v in hist]
+        if len(_all_outcomes) >= 10 and sum(_all_outcomes) == 0:
             from collections import defaultdict, deque as _deque
             log.warning("  ⚠️ Win-rate is 0% with 10+ samples — auto-resetting (phantom loss contamination)")
             _wr_tracker._history = defaultdict(lambda: _deque(maxlen=WINRATE_WINDOW))
             tg("🔄 <b>Auto-reset</b>: win-rate was 0% with 10+ samples — cleared contaminated data. Kelly restored.")
+        # ── Session loss guard: halt if down >25% from session start ──────────
+        if session_start_bankroll > 0 and bankroll < session_start_bankroll * 0.75:
+            log.warning(f"  🛑 SESSION LOSS GUARD: bankroll ${bankroll:.2f} is "
+                        f"{(1-bankroll/session_start_bankroll)*100:.0f}% below session "
+                        f"start ${session_start_bankroll:.2f} — pausing new entries")
+            tg(f"🛑 <b>Session loss guard triggered</b>\n"
+               f"Started at ${session_start_bankroll:.2f}, now ${bankroll:.2f} "
+               f"({(1-bankroll/session_start_bankroll)*100:.0f}% loss)\n"
+               f"New entries paused. Existing positions still managed.")
+            session_start_bankroll = 0.0   # clear so it only fires once per session
+
         if _dd_guard.is_paused:
             log.warning(f"  🚨 Trading paused (drawdown). "
                         f"Bankroll ${bankroll:.2f} / peak ${_dd_guard.peak:.2f}. "
@@ -2886,6 +2900,7 @@ def run_loop(client: ClobClient, wallet: str) -> None:
             if not DRY_RUN and MANUAL_BANKROLL == 0:
                 _balance_cache[1] = 0.0  # invalidate cache
                 bankroll = get_usdc_balance(client, wallet)
+                _dd_guard.update(bankroll)  # re-check drawdown with true balance
 
         # ── Cancel GTC orders older than MAX_ORDER_AGE_HOURS ─────────────────
         om.cancel_aged(client)
@@ -2907,6 +2922,10 @@ def run_loop(client: ClobClient, wallet: str) -> None:
         current_fairs: dict[str, float] = {}
         cycle_orders  = 0
         all_markets:  list[dict] = []   # accumulated for arb scan (no re-fetch)
+
+        # Skip new entries when session loss guard has fired
+        session_guard_active = (session_start_bankroll == 0.0 and
+                                bankroll < pnl.last_portfolio * 0.75)
 
         if not TRADE_DAILY_MARKETS:
             log.info("Daily markets paused (TRADE_DAILY_MARKETS=False — daily WR 45%)")
@@ -2974,9 +2993,14 @@ def run_loop(client: ClobClient, wallet: str) -> None:
         log.info(f"\n{'─'*24} HOURLY MARKETS {'─'*24}")
         hourly_list: list = []
         try:
-            hourly_placed, hourly_list = scan_hourly_markets(client, om, bankroll)
+            if session_guard_active:
+                log.info("  Session loss guard active — skipping new hourly entries")
+                hourly_placed = 0
+                hourly_list   = []
+            else:
+                hourly_placed, hourly_list = scan_hourly_markets(client, om, bankroll)
             cycle_orders += hourly_placed
-            if hourly_placed == 0:
+            if hourly_placed == 0 and not session_guard_active:
                 log.info("  No hourly edge this cycle.")
             # Reuse the already-fetched list to register stale-cancel fairs —
             # avoids a second _collect_hourly_markets() call (doubles Gamma API hits).
