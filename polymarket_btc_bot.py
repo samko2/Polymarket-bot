@@ -67,7 +67,7 @@ TRADE_DAILY_MARKETS   = False   # daily WR=45% (losing); paused until win-rate i
 TAKER_FEE             = 0.02    # Polymarket taker fee on winnings
 KELLY_FRACTION        = 0.45    # 45% Kelly — aggressive but survives bad streaks
 MAX_BET_USDC          = 8.0     # hard cap per order — raised to let high-edge trades get full Kelly size
-MAX_MARKET_EXPOSURE   = 10.0   # hard cap total USDC deployed in any single market token (all entries combined)
+MAX_MARKET_EXPOSURE   = 10.0   # absolute ceiling per market — actual cap = min(this, bankroll*0.12)
 TAKE_PROFIT           = 0.40    # exit when position up ≥40% from entry
 STOP_LOSS             = 0.30    # reverted 0.20→0.30: tight stop caused 61%→27% WR crash from normal market noise
 MIN_BET_USDC          = 0.20    # skip orders below this ($0.50 blocked all kelly bets on $30 bankroll)
@@ -887,7 +887,7 @@ def get_usdc_balance_onchain(wallet: str) -> float:
 
 def get_usdc_balance(client: ClobClient, wallet: str = "") -> float:
     now = time.time()
-    if _balance_cache[1] and now - _balance_cache[1] < 300:
+    if _balance_cache[1] and now - _balance_cache[1] < 45:
         return _balance_cache[0]
     try:
         resp = client.get_balance_allowance(
@@ -1759,7 +1759,7 @@ def process_market(client: ClobClient, om: OrderManager,
         if (net_edge >= MIN_EDGE
                 and not om.has_open_order(token_yes)
                 and not om.already_holds(token_yes)
-                and om.market_exposure_usdc(token_yes) < MAX_MARKET_EXPOSURE):
+                and om.market_exposure_usdc(token_yes) < min(MAX_MARKET_EXPOSURE, bankroll * 0.12)):
             size = kelly_buy(fair, limit, available, mtype="daily", max_bet=dyn_max)
             if size >= MIN_BET_USDC:
                 if place_order(client, om, token_yes, limit, size, fair, label):
@@ -1784,7 +1784,7 @@ def process_market(client: ClobClient, om: OrderManager,
         if (net_edge >= MIN_EDGE and token_no
                 and not om.has_open_order(token_no)
                 and not om.already_holds(token_no)
-                and om.market_exposure_usdc(token_no) < MAX_MARKET_EXPOSURE):
+                and om.market_exposure_usdc(token_no) < min(MAX_MARKET_EXPOSURE, bankroll * 0.12)):
             size = kelly_buy(fair_no, limit, available, mtype="daily", max_bet=dyn_max)
             if size >= MIN_BET_USDC:
                 if place_order(client, om, token_no, limit, size, fair_no, f"{label} NO"):
@@ -2596,7 +2596,7 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float,
                     if (net_edge >= MIN_HOURLY_EDGE
                             and not om.has_open_order(token_up)
                             and not om.already_holds(token_up)
-                            and om.market_exposure_usdc(token_up) < MAX_MARKET_EXPOSURE):
+                            and om.market_exposure_usdc(token_up) < min(MAX_MARKET_EXPOSURE, bankroll * 0.12)):
                         dyn_max_h = min(8.0, bankroll * 0.07) * tod_mult * consensus_mult
                         size = kelly_buy(fair_up, limit, available,
                                          mtype="hourly", max_bet=dyn_max_h)
@@ -2625,7 +2625,7 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float,
                     if (net_edge >= MIN_HOURLY_EDGE
                             and not om.has_open_order(token_down)
                             and not om.already_holds(token_down)
-                            and om.market_exposure_usdc(token_down) < MAX_MARKET_EXPOSURE):
+                            and om.market_exposure_usdc(token_down) < min(MAX_MARKET_EXPOSURE, bankroll * 0.12)):
                         dyn_max_h = min(8.0, bankroll * 0.07) * tod_mult * consensus_mult
                         size = kelly_buy(fair_down, limit, available,
                                          mtype="hourly", max_bet=dyn_max_h)
@@ -2854,6 +2854,17 @@ def run_loop(client: ClobClient, wallet: str) -> None:
         dd_mult  = _dd_mult
         wr_mult  = _wr_tracker.kelly_multiplier()         # "all" — for display only
         _effective_kelly = round(KELLY_FRACTION * dd_mult * wr_mult, 4)
+
+        # ── Auto-reset contaminated win-rate ───────────────────────────────────
+        # If every sample in the last window is a loss (0% WR with 10+ trades),
+        # the data was almost certainly poisoned by the phantom-loss bug.
+        # Auto-clear so Kelly recovers without needing a manual /reset.
+        _all_hist = list(_wr_tracker._history.get("all", []))
+        if len(_all_hist) >= 10 and sum(_all_hist) == 0:
+            from collections import defaultdict, deque as _deque
+            log.warning("  ⚠️ Win-rate is 0% with 10+ samples — auto-resetting (phantom loss contamination)")
+            _wr_tracker._history = defaultdict(lambda: _deque(maxlen=WINRATE_WINDOW))
+            tg("🔄 <b>Auto-reset</b>: win-rate was 0% with 10+ samples — cleared contaminated data. Kelly restored.")
         if _dd_guard.is_paused:
             log.warning(f"  🚨 Trading paused (drawdown). "
                         f"Bankroll ${bankroll:.2f} / peak ${_dd_guard.peak:.2f}. "
@@ -2866,10 +2877,15 @@ def run_loop(client: ClobClient, wallet: str) -> None:
 
         # ── Check for fills ────────────────────────────────────────────────────
         fills = om.refresh_from_api(client)
-        for f in fills:
-            tg(f"💰 <b>FILL</b>  {f['label']}\n"
-               f"{f['size_matched']:.2f}sh @ {f['limit']:.3f} = ${f['filled_usdc']:.2f}\n"
-               f"Fair: {f['fair']:.3f}  Edge: {f['edge_at_fill']:+.3f}")
+        if fills:
+            for f in fills:
+                tg(f"💰 <b>FILL</b>  {f['label']}\n"
+                   f"{f['size_matched']:.2f}sh @ {f['limit']:.3f} = ${f['filled_usdc']:.2f}\n"
+                   f"Fair: {f['fair']:.3f}  Edge: {f['edge_at_fill']:+.3f}")
+            # Force fresh balance so free_bankroll reflects actual cash after fills
+            if not DRY_RUN and MANUAL_BANKROLL == 0:
+                _balance_cache[1] = 0.0  # invalidate cache
+                bankroll = get_usdc_balance(client, wallet)
 
         # ── Cancel GTC orders older than MAX_ORDER_AGE_HOURS ─────────────────
         om.cancel_aged(client)
@@ -2884,8 +2900,8 @@ def run_loop(client: ClobClient, wallet: str) -> None:
         # ── Exit held positions at take-profit / stop-loss ─────────────────────
         scan_exit_positions(client, om, wallet)
 
-        # ── Refresh balance every 5 min ────────────────────────────────────────
-        if not DRY_RUN and MANUAL_BANKROLL == 0 and int(cycle_start) % 300 < POLL_INTERVAL:
+        # ── Refresh balance every 45s (cache TTL) ─────────────────────────────
+        if not DRY_RUN and MANUAL_BANKROLL == 0:
             bankroll = get_usdc_balance(client, wallet)
 
         current_fairs: dict[str, float] = {}
