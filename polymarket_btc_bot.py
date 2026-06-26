@@ -96,7 +96,7 @@ WINRATE_MIN_SAMPLE = 5      # need at least this many before adjusting Kelly
 TAKE_PROFIT_2       = 0.70  # second half of partial TP exits at +70%
 TRAIL_STOP_TRIGGER  = 0.20  # start trailing once position is up ≥20% — protect gains sooner
 TRAIL_STOP_DROP     = 0.10  # exit if bid drops 10% below its peak while trailing
-LOSS_COOLDOWN_HOURS = 1.0   # block same asset+direction for 1h after a stop-loss (faster recovery)
+LOSS_COOLDOWN_HOURS = 0.5   # block same asset+direction for 30min after a stop-loss
 
 # ── Order hygiene ──────────────────────────────────────────────────────────────
 MAX_ORDER_AGE_HOURS = 3.0   # cancel unfilled GTC orders older than this
@@ -1803,7 +1803,7 @@ HOURLY_ASSETS = {
     "ETH":  {"slug_name": "ethereum",     "binance": "ETH"},
     "SOL":  {"slug_name": "solana",       "binance": "SOL"},
     "XRP":  {"slug_name": "xrp",          "binance": "XRP"},
-    "HYPE": {"slug_name": "hyperliquid",  "binance": "HYPE"},
+    # HYPE removed — not on Binance, 3/6 signals always 0
     "DOGE": {"slug_name": "dogecoin",     "binance": "DOGE"},
     "AVAX": {"slug_name": "avalanche",    "binance": "AVAX"},
     "LINK": {"slug_name": "chainlink",    "binance": "LINK"},
@@ -1812,6 +1812,9 @@ HOURLY_ASSETS = {
     "ADA":  {"slug_name": "cardano",      "binance": "ADA"},
     "TON":  {"slug_name": "toncoin",      "binance": "TON"},
     "BNB":  {"slug_name": "bnb",          "binance": "BNB"},
+    # HYPE removed from hourly: not listed on Binance (400 Invalid symbol)
+    # → momentum, imbalance, funding rate all return 0, weakening the 6-signal gate
+    # HYPE stays in ASSETS dict for daily markets when those are re-enabled
 }
 
 
