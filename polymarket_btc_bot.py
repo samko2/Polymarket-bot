@@ -1,10 +1,13 @@
 """
 Polymarket Ultimate Edge Bot  —  v2 Production
 ═══════════════════════════════════════════════
-Assets   : BTC, ETH, SOL
+Assets   : BTC, ETH, SOL, XRP, DOGE, AVAX, LINK, SUI, PEPE, ADA, TON, BNB,
+           LTC, WIF, NEAR, DOT, TRX, XAU (18 crypto/commodity)
+Markets  : Hourly up/down (6-signal consensus), daily price targets,
+           YES+NO structural arb, politics/events (3-signal model)
 Pricing  : European digital + barrier/touch; vol term structure (7d/14d/30d)
 Orders   : GTC limits; order book cross-check; book-aware limit placement
-Sizing   : (bankroll − committed) → quarter-Kelly
+Sizing   : (bankroll − committed) → Kelly; conservative 0.55× for politics
 Safety   : Position awareness on start; exponential-backoff retries;
            crash-proof loop with auto-restart; stale order refresh
 Alerts   : Telegram only on real fills and bot stop
@@ -292,6 +295,66 @@ ASSETS = {
         "coingecko_id":   "binancecoin",
         "keywords":       ["bnb", "binance coin"],
         "daily_names":    ["bnb", "binance coin"],
+        "slugs":          [],
+        "end_date": datetime(2026, 12, 31, 23, 59, tzinfo=timezone.utc),
+    },
+    "LTC": {
+        "vol":            0.70,
+        "drift":          0.15,
+        "binance_symbol": "LTC",
+        "coingecko_id":   "litecoin",
+        "keywords":       ["litecoin", "ltc"],
+        "daily_names":    ["litecoin", "ltc"],
+        "slugs":          [],
+        "end_date": datetime(2026, 12, 31, 23, 59, tzinfo=timezone.utc),
+    },
+    "WIF": {
+        "vol":            1.30,
+        "drift":          0.25,
+        "binance_symbol": "WIF",
+        "coingecko_id":   "dogwifhat",
+        "keywords":       ["dogwifhat", "wif"],
+        "daily_names":    ["dogwifhat", "wif"],
+        "slugs":          [],
+        "end_date": datetime(2026, 12, 31, 23, 59, tzinfo=timezone.utc),
+    },
+    "NEAR": {
+        "vol":            0.85,
+        "drift":          0.15,
+        "binance_symbol": "NEAR",
+        "coingecko_id":   "near",
+        "keywords":       ["near protocol", "near"],
+        "daily_names":    ["near protocol", "near"],
+        "slugs":          [],
+        "end_date": datetime(2026, 12, 31, 23, 59, tzinfo=timezone.utc),
+    },
+    "DOT": {
+        "vol":            0.75,
+        "drift":          0.10,
+        "binance_symbol": "DOT",
+        "coingecko_id":   "polkadot",
+        "keywords":       ["polkadot", "dot"],
+        "daily_names":    ["polkadot", "dot"],
+        "slugs":          [],
+        "end_date": datetime(2026, 12, 31, 23, 59, tzinfo=timezone.utc),
+    },
+    "TRX": {
+        "vol":            0.65,
+        "drift":          0.10,
+        "binance_symbol": "TRX",
+        "coingecko_id":   "tron",
+        "keywords":       ["tron", "trx"],
+        "daily_names":    ["tron", "trx"],
+        "slugs":          [],
+        "end_date": datetime(2026, 12, 31, 23, 59, tzinfo=timezone.utc),
+    },
+    "XAU": {
+        "vol":            0.15,
+        "drift":          0.08,
+        "binance_symbol": "PAXG",
+        "coingecko_id":   "pax-gold",
+        "keywords":       ["gold price", "xau"],
+        "daily_names":    ["gold", "xau"],
         "slugs":          [],
         "end_date": datetime(2026, 12, 31, 23, 59, tzinfo=timezone.utc),
     },
@@ -1812,6 +1875,12 @@ HOURLY_ASSETS = {
     "ADA":  {"slug_name": "cardano",      "binance": "ADA"},
     "TON":  {"slug_name": "toncoin",      "binance": "TON"},
     "BNB":  {"slug_name": "bnb",          "binance": "BNB"},
+    "LTC":  {"slug_name": "litecoin",    "binance": "LTC"},
+    "WIF":  {"slug_name": "wif",         "binance": "WIF"},
+    "NEAR": {"slug_name": "near",        "binance": "NEAR"},
+    "DOT":  {"slug_name": "polkadot",    "binance": "DOT"},
+    "TRX":  {"slug_name": "tron",        "binance": "TRX"},
+    "XAU":  {"slug_name": "gold",        "binance": "PAXG"},
     # HYPE removed from hourly: not listed on Binance (400 Invalid symbol)
     # → momentum, imbalance, funding rate all return 0, weakening the 6-signal gate
     # HYPE stays in ASSETS dict for daily markets when those are re-enabled
@@ -2063,10 +2132,13 @@ _five_min_cache: dict[str, tuple[float, float]] = {}  # asset → (sentiment, ts
 _FIVE_MIN_TTL   = 45.0   # refresh every 45s
 
 _FIVE_MIN_SLUGS: dict[str, str] = {
-    "BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana",
-    "XRP": "xrp",     "DOGE": "dogecoin", "AVAX": "avalanche",
-    "LINK": "chainlink", "HYPE": "hyperliquid", "SUI": "sui",
-    "PEPE": "pepe",   "ADA": "cardano",  "TON": "toncoin",
+    "BTC": "bitcoin",  "ETH": "ethereum",   "SOL": "solana",
+    "XRP": "xrp",      "DOGE": "dogecoin",  "AVAX": "avalanche",
+    "LINK": "chainlink","HYPE": "hyperliquid","SUI": "sui",
+    "PEPE": "pepe",    "ADA": "cardano",    "TON": "toncoin",
+    "BNB": "bnb",      "LTC": "litecoin",   "WIF": "dogwifhat",
+    "NEAR": "near",    "DOT": "polkadot",   "TRX": "tron",
+    "XAU": "gold",
 }
 
 def _five_min_sentiment(asset: str) -> float:
@@ -2430,7 +2502,14 @@ def _collect_hourly_markets() -> list[tuple[dict, str, str]]:
                   ("sui up or down",         "SUI",  "SUI"),
                   ("pepe up or down",        "PEPE", "PEPE"),
                   ("cardano up or down",     "ADA",  "ADA"),
-                  ("toncoin up or down",     "TON",  "TON")]
+                  ("toncoin up or down",     "TON",  "TON"),
+                  ("bnb up or down",         "BNB",  "BNB"),
+                  ("litecoin up or down",    "LTC",  "LTC"),
+                  ("wif up or down",         "WIF",  "WIF"),
+                  ("near up or down",        "NEAR", "NEAR"),
+                  ("polkadot up or down",    "DOT",  "DOT"),
+                  ("tron up or down",        "TRX",  "TRX"),
+                  ("gold up or down",        "XAU",  "PAXG")]
         for kw, asset, bsym in kw_map:
             try:
                 for m in search_gamma(kw, limit=20):
@@ -2713,6 +2792,172 @@ def scan_yes_no_arb(client: ClobClient, om: OrderManager,
                f"YES@{ask_y:.3f} + NO@{ask_n:.3f} = {combined:.3f}\n"
                f"Profit/share: {net_profit:.3f}  ({label_base})")
             placed += 1
+
+    return placed
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# POLITICS / WORLD EVENTS MARKETS
+# Uses 3 Polymarket-internal signals only (no Binance feed):
+#   • Polymarket price momentum (last 20 min CLOB history)
+#   • Polymarket order-book imbalance (bid/ask depth on the CLOB)
+#   • YES+NO structural arb (combined ask < 0.97)
+# Higher edge requirement (0.04) and smaller max bet ($3) vs crypto hourly.
+# ══════════════════════════════════════════════════════════════════════════════
+
+POLITICS_MIN_VOLUME  = 5_000.0  # only liquid markets
+POLITICS_MIN_EDGE    = 0.04     # higher bar — no Binance confirmation
+POLITICS_MAX_BET     = 3.0      # small exposure per market
+POLITICS_MAX_DAYS    = 30       # only markets resolving within 30 days
+POLITICS_MAX_SPREAD  = 0.12     # skip wide spreads
+POLITICS_KELLY_MULT  = 0.55     # conservative sizing
+
+POLITICS_KEYWORDS = [
+    "trump", "fed rate", "federal reserve", "interest rate",
+    "will the us", "will congress", "senate",
+    "inflation", "recession", "oil price",
+    "ceasefire", "china tariff", "will there be",
+]
+
+_politics_cache:    list  = []
+_politics_cache_ts: float = 0.0
+_POLITICS_TTL:      float = 600.0  # re-scan every 10 min
+
+
+def _poly_book_imbalance(token_id: str) -> float:
+    """Polymarket CLOB book imbalance for a single token. Returns [-1, +1]."""
+    try:
+        data    = retry_get(f"{CLOB_HOST}/book", params={"token_id": token_id}, timeout=8).json()
+        bids    = data.get("bids", [])
+        asks    = data.get("asks", [])
+        bid_vol = sum(float(b.get("size", 0)) for b in bids[:10])
+        ask_vol = sum(float(a.get("size", 0)) for a in asks[:10])
+        total   = bid_vol + ask_vol
+        return (bid_vol - ask_vol) / total if total > 0 else 0.0
+    except Exception:
+        return 0.0
+
+
+def scan_politics_markets(client: ClobClient, om: OrderManager, bankroll: float) -> int:
+    """
+    Scan active Polymarket politics/events/macro markets for two opportunity types:
+      1. YES+NO structural arb (guaranteed profit when YES ask + NO ask < 0.97)
+      2. Momentum-based directional edge (both pm_momentum and book imbalance agree)
+    Returns number of orders placed.
+    """
+    global _politics_cache, _politics_cache_ts
+
+    now    = time.time()
+    placed = 0
+
+    # ── Collect candidate markets (cached 10 min) ─────────────────────────────
+    if now - _politics_cache_ts > _POLITICS_TTL:
+        seen: set  = set()
+        markets: list = []
+        for kw in POLITICS_KEYWORDS:
+            for m in search_gamma(kw, limit=30):
+                raw = m.get("clobTokenIds") or []
+                if isinstance(raw, str):
+                    try: raw = json.loads(raw)
+                    except: raw = []
+                tid = raw[0] if raw else m.get("id", "")
+                if tid and tid not in seen:
+                    seen.add(tid)
+                    markets.append(m)
+        _politics_cache    = markets
+        _politics_cache_ts = now
+        log.info(f"  Politics: {len(markets)} candidate markets")
+
+    for m in _politics_cache:
+        if float(m.get("volume") or 0) < POLITICS_MIN_VOLUME:
+            continue
+
+        # Resolution date filter — skip too-far-out or already-resolved
+        end_str = m.get("endDate") or m.get("endDateIso") or ""
+        if end_str:
+            try:
+                end_dt    = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+                days_left = (end_dt - datetime.now(timezone.utc)).days
+                if days_left < 0 or days_left > POLITICS_MAX_DAYS:
+                    continue
+            except Exception:
+                pass
+
+        raw = m.get("clobTokenIds") or []
+        if isinstance(raw, str):
+            try: raw = json.loads(raw)
+            except: continue
+        if len(raw) < 2:
+            continue
+
+        token_yes, token_no = raw[0], raw[1]
+        if (om.already_holds(token_yes) or om.already_holds(token_no)
+                or om.has_open_order(token_yes) or om.has_open_order(token_no)):
+            continue
+        if len(om.held_token_ids) >= MAX_POSITION_TOKENS:
+            break
+
+        bid_y, ask_y, mid_y, liquid_y = get_order_book(token_yes)
+        if not liquid_y or (ask_y - bid_y) > POLITICS_MAX_SPREAD:
+            continue
+        if not (0.05 < mid_y < 0.95):
+            continue
+
+        bid_n, ask_n, mid_n, liquid_n = get_order_book(token_no)
+
+        # ── Structural arb: YES ask + NO ask < 0.97 ─────────────────────────
+        if liquid_n and ask_y + ask_n < (1 - TAKER_FEE):
+            arb_profit = 1.0 - ask_y - ask_n - TAKER_FEE
+            if arb_profit >= ARB_MIN_PROFIT:
+                size     = min(POLITICS_MAX_BET, free_bankroll(bankroll, om) * 0.03)
+                label_y  = f"POL ARB YES: {m.get('question','')[:35]}"
+                label_n  = f"POL ARB NO:  {m.get('question','')[:35]}"
+                ok_y     = place_order(client, om, token_yes, ask_y, size, mid_y, label_y)
+                ok_n     = place_order(client, om, token_no,  ask_n, size, mid_n, label_n)
+                if ok_y or ok_n:
+                    placed += 1
+                    log.info(f"  ✅ Politics arb profit={arb_profit:.3f}: "
+                             f"{m.get('question','')[:50]}")
+                continue
+
+        # ── Directional: both pm_momentum and book imbalance agree ───────────
+        pm_mom   = _polymarket_price_momentum(token_yes)
+        poly_imb = _poly_book_imbalance(token_yes)
+
+        bullish = pm_mom > 0.03 and poly_imb > 0.05
+        bearish = pm_mom < -0.03 and poly_imb < -0.05
+
+        if bullish:
+            nudge    = 0.04 * (abs(pm_mom) + abs(poly_imb))
+            fair_yes = min(0.90, mid_y + nudge)
+            limit    = min(ask_y, round(fair_yes - 0.02, 2))
+            limit    = max(limit, bid_y + 0.01)
+            net_edge = fair_yes * (1 - TAKER_FEE) - limit
+            if net_edge >= POLITICS_MIN_EDGE:
+                avail = free_bankroll(bankroll, om)
+                size  = round(min(POLITICS_MAX_BET, avail * POLITICS_KELLY_MULT * net_edge), 2)
+                if size >= MIN_BET_USDC:
+                    label = f"POL YES: {m.get('question','')[:40]}"
+                    if place_order(client, om, token_yes, limit, size, fair_yes, label):
+                        placed += 1
+                        log.info(f"  ✅ Politics YES edge={net_edge:.3f}: "
+                                 f"{m.get('question','')[:50]}")
+
+        elif bearish and liquid_n and (ask_n - bid_n) <= POLITICS_MAX_SPREAD:
+            nudge    = 0.04 * (abs(pm_mom) + abs(poly_imb))
+            fair_no  = min(0.90, mid_n + nudge)
+            limit    = min(ask_n, round(fair_no - 0.02, 2))
+            limit    = max(limit, bid_n + 0.01)
+            net_edge = fair_no * (1 - TAKER_FEE) - limit
+            if net_edge >= POLITICS_MIN_EDGE:
+                avail = free_bankroll(bankroll, om)
+                size  = round(min(POLITICS_MAX_BET, avail * POLITICS_KELLY_MULT * net_edge), 2)
+                if size >= MIN_BET_USDC:
+                    label = f"POL NO: {m.get('question','')[:41]}"
+                    if place_order(client, om, token_no, limit, size, fair_no, label):
+                        placed += 1
+                        log.info(f"  ✅ Politics NO edge={net_edge:.3f}: "
+                                 f"{m.get('question','')[:50]}")
 
     return placed
 
@@ -3021,6 +3266,20 @@ def run_loop(client: ClobClient, wallet: str) -> None:
 
         if current_fairs:
             om.cancel_stale(client, current_fairs)
+
+        # ── Politics / world events markets ──────────────────────────────────
+        log.info(f"\n{'─'*24} POLITICS MARKETS {'─'*24}")
+        try:
+            if session_guard_active:
+                log.info("  Session loss guard active — skipping politics entries")
+                politics_placed = 0
+            else:
+                politics_placed = scan_politics_markets(client, om, bankroll)
+            cycle_orders += politics_placed
+            if politics_placed == 0 and not session_guard_active:
+                log.info("  No politics edge this cycle.")
+        except Exception as e:
+            log.debug(f"  Politics scan error: {e}")
 
         if cycle_orders == 0:
             log.info("No orders this cycle.")
