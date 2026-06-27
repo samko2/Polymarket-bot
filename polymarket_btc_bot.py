@@ -2234,6 +2234,17 @@ _ASSET_NEWS_KEYWORDS = {
     "DOGE": ["dogecoin", "doge"],
     "AVAX": ["avalanche", "avax"],
     "LINK": ["chainlink", "link"],
+    "SUI":  ["sui"],
+    "PEPE": ["pepe"],
+    "ADA":  ["cardano", "ada"],
+    "TON":  ["toncoin", "ton"],
+    "BNB":  ["bnb", "binance"],
+    "LTC":  ["litecoin", "ltc"],
+    "WIF":  ["dogwifhat", "wif"],
+    "NEAR": ["near protocol", "near"],
+    "DOT":  ["polkadot", "dot"],
+    "TRX":  ["tron", "trx"],
+    "XAU":  ["gold price", "xauusd"],
 }
 _RSS_FEEDS = [
     "https://cointelegraph.com/rss",
@@ -2422,7 +2433,9 @@ MIN_HOURLY_CONVICTION = 0.58  # require ≥58¢ fair — filters near-coinflip b
 MIN_HOURLY_EDGE      = 0.025  # consensus gate handles quality; lower bar finds more opportunities
 MAX_HOURLY_BET_USDC  = 3.0    # cap hourly bets lower than regular $5 max
 NEWS_FAIR_NUDGE  = 0.03   # max ±3¢ shift on hourly fair from news sentiment
-NEWS_VETO_SCORE  = 0.60   # block entry when news strongly opposes direction (≥2 strong keywords)
+NEWS_VETO_SCORE  = 0.80   # block entry when news strongly opposes direction; raised 0.60→0.80 so
+                          # daily F&G extremes (e.g. Extreme Fear=15) don't block hourly UP entries —
+                          # hourly charts bounce even in macro fear; veto only at truly extreme readings
 _NEWS_TTL        = 600    # re-fetch RSS every 10 minutes
 _NEWS_WINDOW     = 7200   # only count articles published in the last 2 hours
 
@@ -2809,19 +2822,18 @@ def scan_yes_no_arb(client: ClobClient, om: OrderManager,
 # Higher edge requirement (0.04) and smaller max bet ($3) vs crypto hourly.
 # ══════════════════════════════════════════════════════════════════════════════
 
-POLITICS_MIN_VOLUME  = 5_000.0  # only liquid markets
-POLITICS_MIN_EDGE    = 0.04     # higher bar — no Binance confirmation
-POLITICS_MAX_BET     = 3.0      # small exposure per market
-POLITICS_MAX_DAYS    = 30       # only markets resolving within 30 days
-POLITICS_MAX_SPREAD  = 0.12     # skip wide spreads
-POLITICS_KELLY_MULT  = 0.55     # conservative sizing
+POLITICS_MIN_VOLUME  = 100_000.0  # $100k+ volume (top liquid binary markets)
+POLITICS_MIN_EDGE    = 0.04       # higher bar — no Binance confirmation
+POLITICS_MAX_BET     = 3.0        # small exposure per market
+POLITICS_MAX_DAYS    = 45         # only markets resolving within 45 days
+POLITICS_MAX_SPREAD  = 0.12       # skip wide spreads
+POLITICS_KELLY_MULT  = 0.55       # conservative sizing
+POLITICS_SCAN_LIMIT  = 100        # top-N markets by volume to scan per refresh
 
-POLITICS_KEYWORDS = [
-    "trump", "fed rate", "federal reserve", "interest rate",
-    "will the us", "will congress", "senate",
-    "inflation", "recession", "oil price",
-    "ceasefire", "china tariff", "will there be",
-]
+# Note: Gamma search API returns results sorted by volume/popularity, not keyword.
+# We scan the top POLITICS_SCAN_LIMIT active markets directly by volume and filter
+# by date window — this catches all high-liquidity binary markets (politics, sports,
+# finance, world events) which are the best candidates for the 2-signal model.
 
 _politics_cache:    list  = []
 _politics_cache_ts: float = 0.0
@@ -2855,11 +2867,28 @@ def scan_politics_markets(client: ClobClient, om: OrderManager, bankroll: float)
     placed = 0
 
     # ── Collect candidate markets (cached 10 min) ─────────────────────────────
+    # Gamma search ranks by volume, not keyword — scan top markets directly and
+    # filter by volume + date. This catches politics, sports, finance, and any
+    # other high-liquidity binary market within our resolution window.
     if now - _politics_cache_ts > _POLITICS_TTL:
         seen: set  = set()
         markets: list = []
-        for kw in POLITICS_KEYWORDS:
-            for m in search_gamma(kw, limit=30):
+        # Exclude hourly crypto up/down markets — those are handled by the hourly scanner
+        crypto_names = {"bitcoin", "ethereum", "solana", "xrp", "dogecoin", "avalanche",
+                        "chainlink", "sui", "pepe", "cardano", "toncoin", "bnb",
+                        "litecoin", "dogwifhat", "near", "polkadot", "tron", "gold",
+                        "hyperliquid"}
+        try:
+            data = retry_get(f"{GAMMA_HOST}/markets",
+                params={"active": "true", "closed": "false",
+                        "limit": POLITICS_SCAN_LIMIT, "order": "volumeNum", "ascending": "false"},
+                timeout=15).json()
+            raw_list = data if isinstance(data, list) else data.get("markets", [])
+            for m in raw_list:
+                q_lower = m.get("question", "").lower()
+                # Skip crypto up/down hourly markets — already handled
+                if any(cn in q_lower for cn in crypto_names) and "up or down" in q_lower:
+                    continue
                 raw = m.get("clobTokenIds") or []
                 if isinstance(raw, str):
                     try: raw = json.loads(raw)
@@ -2868,9 +2897,11 @@ def scan_politics_markets(client: ClobClient, om: OrderManager, bankroll: float)
                 if tid and tid not in seen:
                     seen.add(tid)
                     markets.append(m)
+        except Exception as e:
+            log.debug(f"  Politics market fetch failed: {e}")
         _politics_cache    = markets
         _politics_cache_ts = now
-        log.info(f"  Politics: {len(markets)} candidate markets")
+        log.info(f"  Politics: {len(markets)} candidate markets (top {POLITICS_SCAN_LIMIT} by volume)")
 
     for m in _politics_cache:
         if float(m.get("volume") or 0) < POLITICS_MIN_VOLUME:
@@ -2880,7 +2911,10 @@ def scan_politics_markets(client: ClobClient, om: OrderManager, bankroll: float)
         end_str = m.get("endDate") or m.get("endDateIso") or ""
         if end_str:
             try:
-                end_dt    = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+                end_dt = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+                # endDateIso is date-only ("2026-07-20") → naive datetime; make it UTC
+                if end_dt.tzinfo is None:
+                    end_dt = end_dt.replace(tzinfo=timezone.utc)
                 days_left = (end_dt - datetime.now(timezone.utc)).days
                 if days_left < 0 or days_left > POLITICS_MAX_DAYS:
                     continue
