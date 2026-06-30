@@ -412,13 +412,30 @@ def get_order_book(token_id: str) -> tuple[float, float, float, bool]:
         # Polymarket sorts book arrays with the BEST price LAST (worst first)
         best_bid = max(float(b["price"]) for b in bids) if bids else 0.0
         best_ask = min(float(a["price"]) for a in asks) if asks else 1.0
-        mid      = round((best_bid + best_ask) / 2, 4)
-        # liquid = True when there is a real two-sided book (spread < 95 cents)
-        # The old check used (1.0 - MIN_BOOK_LIQUIDITY) = 0.99, which accepted dead
-        # 0.01/0.99 books (spread = 0.98 ≤ 0.99). Now we require spread < 0.95.
-        liquid   = bool(bids and asks and best_bid > 0 and best_ask < 1
-                        and (best_ask - best_bid) < 0.95)
-        result   = (best_bid, best_ask, mid, liquid)
+        spread   = best_ask - best_bid
+        liquid   = bool(bids and asks and best_bid > 0 and best_ask < 1 and spread < 0.95)
+
+        # Hourly up/down markets use AMM pricing — CLOB shows stub 0.01/0.99 orders
+        # while the real mid is available at /midpoint. Fall back to it when the book
+        # looks empty (spread ≥ 0.90) so these markets aren't incorrectly filtered out.
+        if not liquid or spread >= 0.90:
+            try:
+                mp   = retry_get(f"{CLOB_HOST}/midpoint", params={"token_id": token_id}, timeout=6).json()
+                amm  = float(mp.get("mid", 0))
+                if 0.02 < amm < 0.98:
+                    # Synthesise a tight synthetic book around the AMM mid (±1 tick)
+                    best_bid = round(amm - 0.01, 3)
+                    best_ask = round(amm + 0.01, 3)
+                    mid      = round(amm, 4)
+                    liquid   = True
+                    result   = (best_bid, best_ask, mid, liquid)
+                    _book_cache[token_id] = (now, result)
+                    return result
+            except Exception:
+                pass
+
+        mid    = round((best_bid + best_ask) / 2, 4)
+        result = (best_bid, best_ask, mid, liquid)
         _book_cache[token_id] = (now, result)
         return result
     except Exception:
