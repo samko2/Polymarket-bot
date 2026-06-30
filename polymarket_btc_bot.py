@@ -66,7 +66,7 @@ DRY_RUN               = False   # LIVE TRADING
 POLL_INTERVAL         = 10      # seconds between scans — faster stop-loss execution
 EDGE_BUFFER           = 0.03    # place limit this far below fair (3%)
 MIN_EDGE              = 0.03    # minimum net edge after fee (raised 2%→3% to match hourly quality bar)
-TRADE_DAILY_MARKETS   = False   # daily WR=45% (losing); paused until win-rate improves above 50%
+TRADE_DAILY_MARKETS   = True    # re-enabled: hourly markets gone from Polymarket; daily scanner is only crypto path
 TAKER_FEE             = 0.02    # Polymarket taker fee on winnings
 KELLY_FRACTION        = 0.45    # 45% Kelly — aggressive but survives bad streaks
 MAX_BET_USDC          = 8.0     # hard cap per order — raised to let high-edge trades get full Kelly size
@@ -2822,8 +2822,9 @@ def scan_yes_no_arb(client: ClobClient, om: OrderManager,
 # Higher edge requirement (0.04) and smaller max bet ($3) vs crypto hourly.
 # ══════════════════════════════════════════════════════════════════════════════
 
-POLITICS_MIN_VOLUME  = 100_000.0  # $100k+ volume (top liquid binary markets)
-POLITICS_MIN_EDGE    = 0.04       # higher bar — no Binance confirmation
+POLITICS_MIN_VOLUME  = 50_000.0   # $50k+ volume
+POLITICS_MIN_EDGE    = 0.015      # lowered 0.04→0.015: tight spreads on FIFA/event markets make 4¢ impossible;
+                                   # 1.5¢ covers taker fee and gives positive EV when signals align
 POLITICS_MAX_BET     = 3.0        # small exposure per market
 POLITICS_MAX_DAYS    = 45         # only markets resolving within 45 days
 POLITICS_MAX_SPREAD  = 0.12       # skip wide spreads
@@ -2938,7 +2939,7 @@ def scan_politics_markets(client: ClobClient, om: OrderManager, bankroll: float)
         bid_y, ask_y, mid_y, liquid_y = get_order_book(token_yes)
         if not liquid_y or (ask_y - bid_y) > POLITICS_MAX_SPREAD:
             continue
-        if not (0.05 < mid_y < 0.95):
+        if not (0.03 < mid_y < 0.97):
             continue
 
         bid_n, ask_n, mid_n, liquid_n = get_order_book(token_no)
@@ -2966,10 +2967,12 @@ def scan_politics_markets(client: ClobClient, om: OrderManager, bankroll: float)
         bearish = pm_mom < -0.03 and poly_imb < -0.05
 
         if bullish:
-            nudge    = 0.04 * (abs(pm_mom) + abs(poly_imb))
+            nudge    = 0.12 * (abs(pm_mom) + abs(poly_imb))
             fair_yes = min(0.90, mid_y + nudge)
             limit    = min(ask_y, round(fair_yes - 0.02, 2))
-            limit    = max(limit, bid_y + 0.01)
+            # Floor at bid (not bid+0.01) — tight-spread markets have bid≈ask so
+            # bid+0.01 would push limit above ask, creating spurious negative edge
+            limit    = max(limit, bid_y)
             net_edge = fair_yes * (1 - TAKER_FEE) - limit
             if net_edge >= POLITICS_MIN_EDGE:
                 avail = free_bankroll(bankroll, om)
@@ -2982,10 +2985,10 @@ def scan_politics_markets(client: ClobClient, om: OrderManager, bankroll: float)
                                  f"{m.get('question','')[:50]}")
 
         elif bearish and liquid_n and (ask_n - bid_n) <= POLITICS_MAX_SPREAD:
-            nudge    = 0.04 * (abs(pm_mom) + abs(poly_imb))
+            nudge    = 0.12 * (abs(pm_mom) + abs(poly_imb))
             fair_no  = min(0.90, mid_n + nudge)
             limit    = min(ask_n, round(fair_no - 0.02, 2))
-            limit    = max(limit, bid_n + 0.01)
+            limit    = max(limit, bid_n)
             net_edge = fair_no * (1 - TAKER_FEE) - limit
             if net_edge >= POLITICS_MIN_EDGE:
                 avail = free_bankroll(bankroll, om)
