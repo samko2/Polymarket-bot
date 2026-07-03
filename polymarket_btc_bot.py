@@ -420,7 +420,10 @@ def get_order_book(token_id: str) -> tuple[float, float, float, bool]:
         # looks empty (spread ≥ 0.90) so these markets aren't incorrectly filtered out.
         if not liquid or spread >= 0.90:
             try:
-                mp   = retry_get(f"{CLOB_HOST}/midpoint", params={"token_id": token_id}, timeout=6).json()
+                # attempts=1: this is a best-effort fallback — on dead/resolved
+                # tokens /midpoint fails and 3 attempts with backoff cost ~6s each
+                mp   = retry_get(f"{CLOB_HOST}/midpoint", params={"token_id": token_id}, timeout=6,
+                                 attempts=1).json()
                 amm  = float(mp.get("mid", 0))
                 if 0.02 < amm < 0.98:
                     # Synthesise a tight synthetic book around the AMM mid (±1 tick)
@@ -470,12 +473,26 @@ def get_existing_positions(wallet: str) -> dict[str, float] | None:
             timeout=12,
         ).json()
         held: dict[str, float] = {}
+        skipped_dead = 0
         for p in (data if isinstance(data, list) else []):
             tid  = p.get("asset") or p.get("token_id") or p.get("assetId", "")
             size = float(p.get("size") or p.get("position") or 0)
-            if tid and size > 0.01:
-                held[tid] = float(p.get("avgPrice") or p.get("avg_price") or 0)
-        log.info(f"  Existing positions loaded: {len(held)} token(s)")
+            if not tid or size <= 0.01:
+                continue
+            if tid in _purged_tokens:
+                skipped_dead += 1
+                continue
+            # Resolved-to-zero dust: the API keeps listing it but it will never
+            # trade again. Filter here so it's never imported (and re-purged)
+            # cycle after cycle. curPrice missing → keep, let exit logic decide.
+            cur = p.get("curPrice")
+            if cur is not None and float(cur) < 0.01:
+                _purged_tokens.add(tid)
+                skipped_dead += 1
+                continue
+            held[tid] = float(p.get("avgPrice") or p.get("avg_price") or 0)
+        log.info(f"  Existing positions loaded: {len(held)} token(s)"
+                 + (f" ({skipped_dead} dead/dust skipped)" if skipped_dead else ""))
         return held
     except Exception as e:
         log.warning(f"Could not load positions: {e}")
@@ -648,6 +665,9 @@ class OrderManager:
                         self.held_positions[tracked.token_id] = fill_price  # true entry price
                         self.held_labels[tracked.token_id]   = tracked.label
                         self.recent_fill_ts[tracked.token_id] = time.time()
+                        # Fresh fill un-blacklists the token — otherwise the
+                        # dead-token filter would hide the new position from sync
+                        _purged_tokens.discard(tracked.token_id)
                         if tracked.market_end > 0:
                             self.held_market_end[tracked.token_id] = tracked.market_end
                         fill_events.append({
@@ -798,6 +818,7 @@ def scan_exit_positions(client: ClobClient, om: OrderManager, wallet: str = "") 
         if market_end > 0 and now_ts > market_end + 1800:
             log.info(f"  🧹 Purge expired position {token_id[:12]}… "
                      f"(market ended {(now_ts - market_end)/60:.0f}m ago)")
+            _purged_tokens.add(token_id)
             om.held_positions.pop(token_id, None)
             om.held_labels.pop(token_id, None)
             om.held_market_end.pop(token_id, None)
@@ -814,6 +835,7 @@ def scan_exit_positions(client: ClobClient, om: OrderManager, wallet: str = "") 
             if bid < 0.03 and now_ts - om.recent_fill_ts.get(token_id, 0) > 7200:
                 log.info(f"  🧹 Purge near-zero position {token_id[:12]}… "
                          f"(bid={bid:.3f}) — not counting as loss")
+                _purged_tokens.add(token_id)
                 om.held_positions.pop(token_id, None)
                 om.held_labels.pop(token_id, None)
                 om.held_market_end.pop(token_id, None)
@@ -1411,6 +1433,16 @@ _total_realized_pnl: float = 0.0
 _total_wins:  int = 0
 _total_losses: int = 0
 
+# Tokens purged as dead (resolved-to-zero / dust). The Data API keeps reporting
+# them as long as the dust sits in the wallet, so without this set every
+# position sync re-imports them and the exit scan re-purges them — one book
+# fetch each, every cycle, forever.
+_purged_tokens: set[str] = set()
+
+# Session loss-guard baseline. Persisted so a Railway redeploy doesn't reset
+# the -25% reference point and silently disarm the guard.
+_session_baseline: float = 0.0
+
 
 def record_realized_pnl(pnl_usdc: float, won: bool) -> None:
     """Call on every exit with the USDC profit/loss of that trade."""
@@ -1435,6 +1467,8 @@ def _save_state() -> None:
             "total_pnl":    _total_realized_pnl,
             "total_wins":   _total_wins,
             "total_losses": _total_losses,
+            "purged":       list(_purged_tokens)[:500],
+            "session_baseline": _session_baseline,
             "saved_at":     now,
         }
         with open(_STATE_FILE, "w") as fh:
@@ -1445,7 +1479,7 @@ def _save_state() -> None:
 
 def _load_state() -> None:
     """Restore win-rate history, loss cooldowns, DD peak and cumulative P&L from disk."""
-    global _total_realized_pnl, _total_wins, _total_losses
+    global _total_realized_pnl, _total_wins, _total_losses, _session_baseline
     try:
         with open(_STATE_FILE) as fh:
             data = json.load(fh)
@@ -1466,6 +1500,9 @@ def _load_state() -> None:
         _total_realized_pnl = float(data.get("total_pnl",    0.0))
         _total_wins          = int(data.get("total_wins",   0))
         _total_losses        = int(data.get("total_losses", 0))
+        # Dead-token blacklist + session loss-guard baseline
+        _purged_tokens.update(str(t) for t in data.get("purged", []))
+        _session_baseline = float(data.get("session_baseline", 0.0))
         age_h = (now - float(data.get("saved_at", now))) / 3600
         total_trades = _total_wins + _total_losses
         log.info(f"  🔄 State restored (saved {age_h:.1f}h ago): "
@@ -2790,6 +2827,21 @@ def scan_yes_no_arb(client: ClobClient, om: OrderManager,
         if float(m.get("volume") or 0) < MIN_VOLUME:
             continue
 
+        # Pre-filter on Gamma's own quotes before touching the CLOB. For a binary
+        # market, NO ask ≈ 1 - YES bid, so combined ask ≈ bestAsk + (1 - bestBid).
+        # An arb needs that under (1 - fee - min_profit) — i.e. a crossed book,
+        # which is rare. Skipping the ~2 book calls per market here is what cuts
+        # the arb scan from ~13 minutes to seconds. Missing quotes → fall through.
+        try:
+            g_bid = float(m.get("bestBid") or 0)
+            g_ask = float(m.get("bestAsk") or 0)
+        except (TypeError, ValueError):
+            g_bid = g_ask = 0.0
+        if 0 < g_bid and 0 < g_ask < 1:
+            est_combined = g_ask + (1.0 - g_bid)
+            if est_combined > (1.0 - TAKER_FEE) - ARB_MIN_PROFIT + 0.02:  # +2¢ staleness margin
+                continue
+
         try:
             bid_y, ask_y, _, liq_y = get_order_book(token_yes)
             bid_n, ask_n, _, liq_n = get_order_book(token_no)
@@ -3116,6 +3168,8 @@ class PnL:
 
 def run_loop(client: ClobClient, wallet: str) -> None:
     """Inner loop — runs until KeyboardInterrupt or unrecoverable error."""
+    global _session_baseline
+    _load_state()   # before position load — restores the dead-token blacklist
     om  = OrderManager(get_existing_positions(wallet))
     # Merge fills from the last 2h that /positions may not have indexed yet —
     # prevents double-buying the same market right after a restart
@@ -3123,6 +3177,7 @@ def run_loop(client: ClobClient, wallet: str) -> None:
         if tid not in om.held_positions:
             om.held_positions[tid] = entry
             om.recent_fill_ts[tid] = time.time()
+            _purged_tokens.discard(tid)   # recently bought — clearly not dead dust
     pnl = PnL(wallet)
 
     if MANUAL_BANKROLL > 0:
@@ -3133,9 +3188,18 @@ def run_loop(client: ClobClient, wallet: str) -> None:
     last_reset = time.time()
 
     log.info(f"Loop started. Balance: ${bankroll:.2f}  Positions loaded: {len(om.held_token_ids)}")
-    _load_state()   # restore win-rate, cooldowns and DD peak from previous session
     pnl.snapshot_baseline(bankroll)
-    session_start_bankroll = bankroll   # track session-start balance for intra-session loss guard
+    # Loss-guard baseline persists across restarts/redeploys so the -25% guard
+    # measures real cumulative loss, not loss-since-last-push. A fresh baseline
+    # is only taken when no persisted one exists (first run, or after /reset).
+    if _session_baseline <= 0:
+        _session_baseline = bankroll
+        _save_state()
+        log.info(f"  Session loss-guard baseline set: ${_session_baseline:.2f}")
+    else:
+        log.info(f"  Session loss-guard baseline restored: ${_session_baseline:.2f} "
+                 f"(current ${bankroll:.2f})")
+    session_start_bankroll = _session_baseline
     # Drain any stale Telegram updates so old /report commands don't double-fire
     _poll_tg_commands()
     # Send a startup report so any missed daily reports are covered immediately
@@ -3184,6 +3248,8 @@ def run_loop(client: ClobClient, wallet: str) -> None:
                f"({(1-bankroll/session_start_bankroll)*100:.0f}% loss)\n"
                f"New entries paused. Existing positions still managed.")
             session_start_bankroll = 0.0   # clear so it only fires once per session
+            _session_baseline = 0.0        # persist: next start re-baselines at current bankroll
+            _save_state()
 
         if _dd_guard.is_paused:
             log.warning(f"  🚨 Trading paused (drawdown). "
