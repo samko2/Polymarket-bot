@@ -499,6 +499,50 @@ def get_existing_positions(wallet: str) -> dict[str, float] | None:
         return None
 
 
+_pos_value_cache: list = [0.0, 0.0]   # [ts, value] — Data API mark-to-market
+
+
+def get_position_value(wallet: str) -> float:
+    """
+    Mark-to-market USDC value of all held positions (incl. redeemable winners)
+    from the Data API. Used so the loss guards measure portfolio value — cash
+    spent buying a position is not a loss. Cached 240s; last value on failure.
+    """
+    if not wallet:
+        return 0.0
+    now = time.time()
+    if now - _pos_value_cache[0] < 240:
+        return _pos_value_cache[1]
+    try:
+        data = retry_get(
+            f"{DATA_HOST}/positions",
+            params={"user": wallet, "sizeThreshold": "0.01"},
+            timeout=12,
+        ).json()
+        val = sum(float(p.get("currentValue") or 0)
+                  for p in (data if isinstance(data, list) else []))
+        _pos_value_cache[0], _pos_value_cache[1] = now, val
+        return val
+    except Exception:
+        return _pos_value_cache[1]
+
+
+def _fetch_raw_positions(wallet: str) -> dict:
+    """{token_id: raw Data-API position dict} — curPrice, size, redeemable, …"""
+    if not wallet:
+        return {}
+    try:
+        data = retry_get(
+            f"{DATA_HOST}/positions",
+            params={"user": wallet, "sizeThreshold": "0.01"},
+            timeout=12,
+        ).json()
+        return {(p.get("asset") or p.get("token_id") or ""): p
+                for p in (data if isinstance(data, list) else [])}
+    except Exception:
+        return {}
+
+
 def get_recent_buys(wallet: str, hours: float = 2.0) -> dict[str, float]:
     """
     Net recently-bought tokens from the activity feed: {token_id: avg_buy_price}.
@@ -806,16 +850,34 @@ def scan_exit_positions(client: ClobClient, om: OrderManager, wallet: str = "") 
     if DRY_RUN:
         return
     now_ts = time.time()
+    api_positions: dict | None = None   # lazy: fetched once per scan when needed
     for token_id, entry in list(om.held_positions.items()):
         if entry <= 0:
             continue
 
         # ── Stale position cleanup ─────────────────────────────────────────
-        # Purge silently — do NOT record as win/loss. These are legacy positions
-        # from previous sessions or expired markets; counting them as losses
-        # contaminates the win-rate tracker with phantom data.
+        # Positions ENTERED THIS SESSION (recent_fill_ts known) get their
+        # settlement outcome recorded — otherwise hold-to-expiry results never
+        # reach the win-rate tracker and Kelly sizes from survivor-biased data
+        # (pre-expiry exits only). Legacy positions still purge silently.
         market_end = om.held_market_end.get(token_id, 0.0)
         if market_end > 0 and now_ts > market_end + 1800:
+            if token_id in om.recent_fill_ts:
+                if api_positions is None:
+                    api_positions = _fetch_raw_positions(wallet)
+                p = api_positions.get(token_id)
+                if p is not None:
+                    cur  = float(p.get("curPrice") or 0)
+                    size = float(p.get("size") or 0)
+                    if size > 0 and (cur >= 0.99 or cur <= 0.01):
+                        won      = cur >= 0.99
+                        pnl_usdc = round(size * (1 - entry) * (1 - TAKER_FEE)
+                                         if won else -size * entry, 2)
+                        label    = om.held_labels.get(token_id, "")
+                        log.info(f"  🏁 Expiry settle {'WIN' if won else 'LOSS'} "
+                                 f"{pnl_usdc:+.2f} USDC  {label or token_id[:16]}")
+                        _wr_tracker.record_exit(label, won=won)
+                        record_realized_pnl(pnl_usdc, won=won)
             log.info(f"  🧹 Purge expired position {token_id[:12]}… "
                      f"(market ended {(now_ts - market_end)/60:.0f}m ago)")
             _purged_tokens.add(token_id)
@@ -1320,6 +1382,16 @@ class DrawdownGuard:
                 tg(f"✅ <b>Drawdown recovered</b>\nBankroll: ${bankroll:.2f}")
             self.peak   = bankroll
             self._state = "ok"
+        elif (self._state == "pause" and self.peak > 0
+                and bankroll >= self.peak * (1 - DRAWDOWN_WARN_PCT)):
+            # Partial recovery back above the warn line: resume at halved Kelly
+            # (matches what the pause alert promises). Full Kelly needs a new peak.
+            self._state = "warn"
+            log.info(f"  ✅ Drawdown guard: pause lifted at ${bankroll:.2f} "
+                     f"(above {(1-DRAWDOWN_WARN_PCT)*100:.0f}% of peak "
+                     f"${self.peak:.2f}) — trading resumes at half Kelly")
+            tg(f"✅ <b>Drawdown pause lifted</b>\nBankroll ${bankroll:.2f} — "
+               f"trading resumes at half Kelly until a new peak")
 
     def kelly_multiplier(self, bankroll: float) -> float:
         if self.peak <= 0:
@@ -1442,6 +1514,10 @@ _purged_tokens: set[str] = set()
 # Session loss-guard baseline. Persisted so a Railway redeploy doesn't reset
 # the -25% reference point and silently disarm the guard.
 _session_baseline: float = 0.0
+
+# Rate-limiter for the drawdown-pause warning (was one line every 10s,
+# flooding Railway's log window past retrievability)
+_last_pause_log: list = [0.0]
 
 
 def record_realized_pnl(pnl_usdc: float, won: bool) -> None:
@@ -1696,9 +1772,18 @@ def _rate_limit_ok() -> bool:
     return True
 
 
+# Set by run_loop when a loss guard is active: blocks new BUY entries at the
+# single choke point all scanners share. Exits sell via create_and_post_order
+# directly, so position management keeps working while entries are blocked.
+_entries_blocked = False
+
+
 def place_order(client: ClobClient, om: OrderManager,
                 token_id: str, limit: float, size_usdc: float,
                 fair: float, label: str, market_end: float = 0.0) -> bool:
+    if _entries_blocked:
+        log.debug(f"  Entry blocked (loss guard active): {label}")
+        return False
     POLY_MIN_SHARES = 5                    # Polymarket CLOB rejects orders below 5 shares
     shares = round(size_usdc / limit, 4)
     if shares < POLY_MIN_SHARES:
@@ -3221,9 +3306,14 @@ def run_loop(client: ClobClient, wallet: str) -> None:
             last_reset = cycle_start
 
         # ── Drawdown guard + dynamic Kelly ────────────────────────────────────
+        # Guards measure PORTFOLIO value (cash + position marks), not cash:
+        # USDC spent buying a position is capital deployed, not capital lost.
+        # Measuring cash alone made every ~30%-of-bankroll deployment look like
+        # a 30% drawdown and false-triggered the pause.
         global _effective_kelly, _dd_mult
-        _dd_guard.update(bankroll)
-        _dd_mult = _dd_guard.kelly_multiplier(bankroll)   # cached for kelly_buy per-type calc
+        portfolio = bankroll + (0.0 if DRY_RUN else get_position_value(wallet))
+        _dd_guard.update(portfolio)
+        _dd_mult = _dd_guard.kelly_multiplier(portfolio)  # cached for kelly_buy per-type calc
         dd_mult  = _dd_mult
         wr_mult  = _wr_tracker.kelly_multiplier()         # "all" — for display only
         _effective_kelly = round(KELLY_FRACTION * dd_mult * wr_mult, 4)
@@ -3238,25 +3328,38 @@ def run_loop(client: ClobClient, wallet: str) -> None:
             log.warning("  ⚠️ Win-rate is 0% with 10+ samples — auto-resetting (phantom loss contamination)")
             _wr_tracker._history = defaultdict(lambda: _deque(maxlen=WINRATE_WINDOW))
             tg("🔄 <b>Auto-reset</b>: win-rate was 0% with 10+ samples — cleared contaminated data. Kelly restored.")
-        # ── Session loss guard: halt if down >25% from session start ──────────
-        if session_start_bankroll > 0 and bankroll < session_start_bankroll * 0.75:
-            log.warning(f"  🛑 SESSION LOSS GUARD: bankroll ${bankroll:.2f} is "
-                        f"{(1-bankroll/session_start_bankroll)*100:.0f}% below session "
+        # ── Session loss guard: halt if down >25% from baseline ───────────────
+        # Portfolio-based, and the baseline ratchets up with new highs (also
+        # absorbs deposits) so it protects current capital, not an old number.
+        if portfolio > session_start_bankroll > 0:
+            session_start_bankroll = portfolio
+            if portfolio > _session_baseline:
+                _session_baseline = portfolio
+                _save_state()
+        if session_start_bankroll > 0 and portfolio < session_start_bankroll * 0.75:
+            log.warning(f"  🛑 SESSION LOSS GUARD: portfolio ${portfolio:.2f} is "
+                        f"{(1-portfolio/session_start_bankroll)*100:.0f}% below session "
                         f"start ${session_start_bankroll:.2f} — pausing new entries")
             tg(f"🛑 <b>Session loss guard triggered</b>\n"
-               f"Started at ${session_start_bankroll:.2f}, now ${bankroll:.2f} "
-               f"({(1-bankroll/session_start_bankroll)*100:.0f}% loss)\n"
+               f"Started at ${session_start_bankroll:.2f}, now ${portfolio:.2f} "
+               f"({(1-portfolio/session_start_bankroll)*100:.0f}% loss)\n"
                f"New entries paused. Existing positions still managed.")
             session_start_bankroll = 0.0   # clear so it only fires once per session
             _session_baseline = 0.0        # persist: next start re-baselines at current bankroll
             _save_state()
 
+        # ── Drawdown pause: block NEW entries only ─────────────────────────────
+        # The old behaviour (sleep + continue) skipped fills, cancels and exits —
+        # positions became unmanageable, cash could never recover, and the
+        # warning spammed the logs every 10s. Now the cycle runs normally with
+        # entries blocked at place_order, and the warning logs every 10 min.
+        global _entries_blocked
         if _dd_guard.is_paused:
-            log.warning(f"  🚨 Trading paused (drawdown). "
-                        f"Bankroll ${bankroll:.2f} / peak ${_dd_guard.peak:.2f}. "
-                        f"Win-rate: {_wr_tracker.summary()}")
-            time.sleep(POLL_INTERVAL)
-            continue
+            if time.time() - _last_pause_log[0] > 600:
+                _last_pause_log[0] = time.time()
+                log.warning(f"  🚨 Entries paused (drawdown). "
+                            f"Portfolio ${portfolio:.2f} / peak ${_dd_guard.peak:.2f}. "
+                            f"Positions still managed. Win-rate: {_wr_tracker.summary()}")
         if _effective_kelly < KELLY_FRACTION:
             log.info(f"  Kelly reduced: {_effective_kelly:.4f} "
                      f"(dd×{dd_mult:.2f} wr×{wr_mult:.2f})")
@@ -3297,7 +3400,9 @@ def run_loop(client: ClobClient, wallet: str) -> None:
 
         # Skip new entries when session loss guard has fired
         session_guard_active = (session_start_bankroll == 0.0 and
-                                bankroll < pnl.last_portfolio * 0.75)
+                                portfolio < pnl.last_portfolio * 0.75)
+        # Single switch all scanners share via place_order
+        _entries_blocked = _dd_guard.is_paused or session_guard_active
 
         if not TRADE_DAILY_MARKETS:
             log.info("Daily markets paused (TRADE_DAILY_MARKETS=False — daily WR 45%)")
@@ -3365,14 +3470,14 @@ def run_loop(client: ClobClient, wallet: str) -> None:
         log.info(f"\n{'─'*24} HOURLY MARKETS {'─'*24}")
         hourly_list: list = []
         try:
-            if session_guard_active:
-                log.info("  Session loss guard active — skipping new hourly entries")
+            if _entries_blocked:
+                log.info("  Loss guard active — skipping new hourly entries")
                 hourly_placed = 0
                 hourly_list   = []
             else:
                 hourly_placed, hourly_list = scan_hourly_markets(client, om, bankroll)
             cycle_orders += hourly_placed
-            if hourly_placed == 0 and not session_guard_active:
+            if hourly_placed == 0 and not _entries_blocked:
                 log.info("  No hourly edge this cycle.")
             # Reuse the already-fetched list to register stale-cancel fairs —
             # avoids a second _collect_hourly_markets() call (doubles Gamma API hits).
@@ -3394,13 +3499,13 @@ def run_loop(client: ClobClient, wallet: str) -> None:
         # ── Politics / world events markets ──────────────────────────────────
         log.info(f"\n{'─'*24} POLITICS MARKETS {'─'*24}")
         try:
-            if session_guard_active:
-                log.info("  Session loss guard active — skipping politics entries")
+            if _entries_blocked:
+                log.info("  Loss guard active — skipping politics entries")
                 politics_placed = 0
             else:
                 politics_placed = scan_politics_markets(client, om, bankroll)
             cycle_orders += politics_placed
-            if politics_placed == 0 and not session_guard_active:
+            if politics_placed == 0 and not _entries_blocked:
                 log.info("  No politics edge this cycle.")
         except Exception as e:
             log.debug(f"  Politics scan error: {e}")
