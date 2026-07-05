@@ -67,6 +67,8 @@ POLL_INTERVAL         = 10      # seconds between scans — faster stop-loss exe
 EDGE_BUFFER           = 0.03    # place limit this far below fair (3%)
 MIN_EDGE              = 0.03    # minimum net edge after fee (raised 2%→3% to match hourly quality bar)
 TRADE_DAILY_MARKETS   = True    # re-enabled: hourly markets gone from Polymarket; daily scanner is only crypto path
+DAILY_SCAN_EVERY      = 3       # run the 18-asset daily scan every Nth cycle — daily markets move
+                                # slowly, and skipping it keeps exit/stop-loss checks ~2 min apart
 TAKER_FEE             = 0.02    # Polymarket taker fee on winnings
 KELLY_FRACTION        = 0.45    # 45% Kelly — aggressive but survives bad streaks
 MAX_BET_USDC          = 8.0     # hard cap per order — raised to let high-edge trades get full Kelly size
@@ -2015,10 +2017,11 @@ HOURLY_ASSETS = {
     "LINK": {"slug_name": "chainlink",    "binance": "LINK"},
     "SUI":  {"slug_name": "sui",          "binance": "SUI"},
     "PEPE": {"slug_name": "pepe",         "binance": "PEPE"},
-    "ADA":  {"slug_name": "cardano",      "binance": "ADA"},
+    # ADA + LTC removed from hourly: Polymarket lists no hourly up/down markets
+    # for them (0/4 slug hits, verified 2026-07-05) — 16 wasted lookups/cycle.
+    # Both remain in ASSETS for the daily scanner.
     "TON":  {"slug_name": "toncoin",      "binance": "TON"},
     "BNB":  {"slug_name": "bnb",          "binance": "BNB"},
-    "LTC":  {"slug_name": "litecoin",    "binance": "LTC"},
     "WIF":  {"slug_name": "wif",         "binance": "WIF"},
     "NEAR": {"slug_name": "near",        "binance": "NEAR"},
     "DOT":  {"slug_name": "polkadot",    "binance": "DOT"},
@@ -2502,8 +2505,7 @@ class _NewsCache:
             self._ts     = time.time()
             log.info(
                 "  News sentiment (F&G+RSS): "
-                + "  ".join(f"{a}={self._scores.get(a, 0.0):+.2f}"
-                             for a in ("BTC", "ETH", "SOL", "XRP", "HYPE"))
+                + "  ".join(f"{a}={s:+.2f}" for a, s in sorted(self._scores.items()))
             )
         return self._scores
 
@@ -2657,10 +2659,8 @@ def _collect_hourly_markets() -> list[tuple[dict, str, str]]:
                   ("chainlink up or down",   "LINK", "LINK"),
                   ("sui up or down",         "SUI",  "SUI"),
                   ("pepe up or down",        "PEPE", "PEPE"),
-                  ("cardano up or down",     "ADA",  "ADA"),
                   ("toncoin up or down",     "TON",  "TON"),
                   ("bnb up or down",         "BNB",  "BNB"),
-                  ("litecoin up or down",    "LTC",  "LTC"),
                   ("wif up or down",         "WIF",  "WIF"),
                   ("near up or down",        "NEAR", "NEAR"),
                   ("polkadot up or down",    "DOT",  "DOT"),
@@ -3290,6 +3290,7 @@ def run_loop(client: ClobClient, wallet: str) -> None:
         log.info(f"  Session loss-guard baseline restored: ${_session_baseline:.2f} "
                  f"(current ${bankroll:.2f})")
     session_start_bankroll = _session_baseline
+    cycle_count = 0   # daily scan runs on cycles 1, 1+N, 1+2N, … (first cycle always scans)
     # Drain any stale Telegram updates so old /report commands don't double-fire
     _poll_tg_commands()
     # Send a startup report so any missed daily reports are covered immediately
@@ -3412,9 +3413,18 @@ def run_loop(client: ClobClient, wallet: str) -> None:
         if not TRADE_DAILY_MARKETS:
             log.info("Daily markets paused (TRADE_DAILY_MARKETS=False — daily WR 45%)")
 
+        # Daily markets move slowly — the 18-asset scan (~3 min of API calls)
+        # only runs every DAILY_SCAN_EVERY cycles so exits and the hourly
+        # scanner get checked far more often. Hourly is where the edge is.
+        cycle_count += 1
+        run_daily = TRADE_DAILY_MARKETS and (cycle_count % DAILY_SCAN_EVERY == 1)
+        if TRADE_DAILY_MARKETS and not run_daily:
+            log.info(f"Daily scan skipped this cycle "
+                     f"(runs every {DAILY_SCAN_EVERY}) — prioritising exits/hourly")
+
         for asset, cfg in ASSETS.items():
-            if not TRADE_DAILY_MARKETS:
-                break  # skip the entire daily scan
+            if not run_daily:
+                break  # skip the entire daily scan this cycle
 
             spot = get_price(cfg["coingecko_id"], cfg["binance_symbol"])
             if not spot:
