@@ -2916,16 +2916,21 @@ def scan_yes_no_arb(client: ClobClient, om: OrderManager,
         # market, NO ask ≈ 1 - YES bid, so combined ask ≈ bestAsk + (1 - bestBid).
         # An arb needs that under (1 - fee - min_profit) — i.e. a crossed book,
         # which is rare. Skipping the ~2 book calls per market here is what cuts
-        # the arb scan from ~13 minutes to seconds. Missing quotes → fall through.
+        # the arb scan from ~12 minutes to seconds.
         try:
             g_bid = float(m.get("bestBid") or 0)
             g_ask = float(m.get("bestAsk") or 0)
         except (TypeError, ValueError):
             g_bid = g_ask = 0.0
-        if 0 < g_bid and 0 < g_ask < 1:
-            est_combined = g_ask + (1.0 - g_bid)
-            if est_combined > (1.0 - TAKER_FEE) - ARB_MIN_PROFIT + 0.02:  # +2¢ staleness margin
-                continue
+        # Missing / zero / one-sided quotes mean a dead book — an arb needs live
+        # asks on BOTH legs, so these can never qualify. Skipping them matters:
+        # the collected market list carries hundreds of stale markets whose
+        # dead books previously fell through to ~4 HTTP calls each.
+        if not (0 < g_bid and 0 < g_ask < 1):
+            continue
+        est_combined = g_ask + (1.0 - g_bid)
+        if est_combined > (1.0 - TAKER_FEE) - ARB_MIN_PROFIT + 0.02:  # +2¢ staleness margin
+            continue
 
         try:
             bid_y, ask_y, _, liq_y = get_order_book(token_yes)
