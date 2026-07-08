@@ -101,7 +101,19 @@ WINRATE_MIN_SAMPLE = 5      # need at least this many before adjusting Kelly
 TAKE_PROFIT_2       = 0.70  # second half of partial TP exits at +70%
 TRAIL_STOP_TRIGGER  = 0.20  # start trailing once position is up ≥20% — protect gains sooner
 TRAIL_STOP_DROP     = 0.10  # exit if bid drops 10% below its peak while trailing
-LOSS_COOLDOWN_HOURS = 0.5   # block same asset+direction for 30min after a stop-loss
+LOSS_COOLDOWN_HOURS = 2.0   # block same asset+direction after a stop-loss. Was 0.5h —
+                            # too short to outlast an adverse regime: on Jul 6 the bot
+                            # re-entered BTC DOWN 63 min after a stop and lost 4 more times
+MAX_HOURLY_ENTRY_PRICE = 0.60  # never buy an hourly side above 60¢ — the move is already
+                               # priced in and there is no room left to be paid for being
+                               # right (Jul 6 9AM: bought DOWN at 0.57-0.71 after the drop,
+                               # all four stopped out on the intra-hour bounce)
+# Direction-wide streak brake: the per-asset cooldown doesn't stop the bot
+# rotating assets in the same wrong direction (Jul 6: BTC→XRP→DOGE→BNB, all
+# DOWN, 8 straight losses in a rising market). N hourly losses in one
+# direction within the window block that direction across ALL assets.
+DIR_STREAK_N      = 3
+DIR_STREAK_WINDOW = 3 * 3600
 
 # ── Order hygiene ──────────────────────────────────────────────────────────────
 MAX_ORDER_AGE_HOURS = 3.0   # cancel unfilled GTC orders older than this
@@ -880,6 +892,8 @@ def scan_exit_positions(client: ClobClient, om: OrderManager, wallet: str = "") 
                                  f"{pnl_usdc:+.2f} USDC  {label or token_id[:16]}")
                         _wr_tracker.record_exit(label, won=won)
                         record_realized_pnl(pnl_usdc, won=won)
+                        if not won:
+                            _record_dir_loss(label)
             log.info(f"  🧹 Purge expired position {token_id[:12]}… "
                      f"(market ended {(now_ts - market_end)/60:.0f}m ago)")
             _purged_tokens.add(token_id)
@@ -890,8 +904,11 @@ def scan_exit_positions(client: ClobClient, om: OrderManager, wallet: str = "") 
             om.partial_exit_done.discard(token_id)
             continue
 
-        if now_ts - om.recent_fill_ts.get(token_id, 0) < 900:
-            continue  # held <15 min — entry price may not be settled
+        # Was 15 min — long enough for a fast adverse move to blow through the
+        # stop unprotected (Jul 5 BTC 9PM: -66%, Jul 6 BNB: -49%). 5 min is
+        # plenty for the fill price to settle.
+        if now_ts - om.recent_fill_ts.get(token_id, 0) < 300:
+            continue  # held <5 min — entry price may not be settled
         try:
             bid, ask, _, liquid = get_order_book(token_id)
 
@@ -961,6 +978,19 @@ def scan_exit_positions(client: ClobClient, om: OrderManager, wallet: str = "") 
             if reason is None:
                 continue
 
+            # ── No stop-losses in the final 20 min (hourly) ────────────────
+            # Near expiry the token trades like a binary and whipsaws hard;
+            # bids are thin and stops fill terribly. Jul 6 9AM: four DOWN
+            # positions stop-lossed at -34..-66% ~15 min before expiry — and
+            # the hour resolved DOWN. Ride it to settlement instead: worst
+            # case is the entry stake, and take-profit/trailing still run.
+            if ("stop-loss" in reason and is_hourly and market_end > 0
+                    and (market_end - now_ts) < 1200):
+                log.info(f"  Hold through stop {token_id[:12]}…: "
+                         f"{(market_end - now_ts)/60:.0f}m to expiry, "
+                         f"letting it resolve instead of selling into a thin book")
+                continue
+
             # ── Determine shares to sell ───────────────────────────────────
             shares = round(_get_position_size(wallet, token_id), 2)
             if shares < 5.0:
@@ -1005,6 +1035,7 @@ def scan_exit_positions(client: ClobClient, om: OrderManager, wallet: str = "") 
                     om.clear_exposure(token_id)
                     _pos_size_cache.pop(token_id, None)
                     if "stop-loss" in reason:
+                        _record_dir_loss(label)
                         ck = _cooldown_key(label)
                         if ck:
                             _loss_cooldown[ck] = time.time()
@@ -1497,6 +1528,28 @@ _dd_mult: float  = 1.0   # cached drawdown multiplier — used by kelly_buy
 # Loss cooldown: maps "BTC_UP" / "ETH_DOWN" etc. → timestamp of last stop-loss
 _loss_cooldown: dict[str, float] = {}
 
+# Timestamps of recent hourly losses per direction (any asset) — feeds the
+# direction-wide streak brake (DIR_STREAK_N losses in DIR_STREAK_WINDOW).
+_dir_losses: dict[str, deque] = {"UP": deque(maxlen=10), "DOWN": deque(maxlen=10)}
+
+
+def _record_dir_loss(label: str) -> None:
+    """Register an hourly loss for the direction streak brake."""
+    lbl = (label or "").upper()
+    if "HOURLY" not in lbl and " ET " not in lbl:
+        return
+    for d in ("UP", "DOWN"):
+        if f" {d} " in f" {lbl} ":
+            _dir_losses[d].append(time.time())
+            return
+
+
+def _dir_streak_blocked(direction: str) -> bool:
+    """True when this direction has ≥ DIR_STREAK_N hourly losses in the window."""
+    now = time.time()
+    return sum(1 for t in _dir_losses.get(direction, ())
+               if now - t < DIR_STREAK_WINDOW) >= DIR_STREAK_N
+
 # ── State persistence ──────────────────────────────────────────────────────────
 # Survives process crashes and container restarts within the same Railway deploy.
 # Lost on new deploys (code pushes) — add a Railway Volume for full persistence.
@@ -1711,8 +1764,14 @@ def build_client() -> ClobClient:
     # contract address, not the EOA. Without it orders get "maker not allowed".
     funder = None
     if detected_sig_type != 0:
+        # Explicit override wins — skip auto-detection (and its failure warning)
+        funder = os.getenv("POLY_FUNDER")
+        if funder:
+            log.info(f"  Using POLY_FUNDER override as proxy wallet: {funder}")
         # Try to extract proxy addr from the balance response itself
         for key in ("proxyWallet", "proxy_wallet", "proxy", "maker", "address"):
+            if funder:
+                break
             val = raw_bal_response.get(key)
             if val and str(val).lower() not in (wallet.lower(), "", "0x0",
                                                 "0x0000000000000000000000000000000000000000"):
@@ -1729,7 +1788,6 @@ def build_client() -> ClobClient:
         else:
             log.warning("  ⚠️ Could not determine proxy wallet address. "
                         "Orders may fail — set POLY_FUNDER env var to your proxy address.")
-            funder = os.getenv("POLY_FUNDER")  # manual override escape hatch
 
     # ── Step 4: Derive API key with the matching signature type ───────────────
     if detected_sig_type == 0:
@@ -2733,7 +2791,7 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float,
             log.debug(f"    Skip {asset} hourly: already holding a {asset} hourly position")
             continue
 
-        # ── Loss cooldown: skip direction for 1.5h after a stop-loss ───────
+        # ── Loss cooldown: skip asset+direction after a stop-loss ──────────
         now_ts    = time.time()
         up_on_cd  = now_ts - _loss_cooldown.get(f"{asset}_UP",   0) < LOSS_COOLDOWN_HOURS * 3600
         dn_on_cd  = now_ts - _loss_cooldown.get(f"{asset}_DOWN", 0) < LOSS_COOLDOWN_HOURS * 3600
@@ -2820,6 +2878,9 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float,
                 log.info(f"    Skip {asset} UP: news bearish ({news_score:+.2f})")
             elif up_on_cd:
                 log.info(f"    Skip {asset} UP: loss cooldown active")
+            elif _dir_streak_blocked("UP"):
+                log.info(f"    Skip {asset} UP: {DIR_STREAK_N}+ UP losses across assets "
+                         f"in {DIR_STREAK_WINDOW//3600}h — direction brake")
             else:
                 bid, ask, book_mid, liquid = get_order_book(token_up)
                 if not liquid:
@@ -2833,7 +2894,10 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float,
                     limit    = min(limit, ask)  # allow taker fill when fair > ask
                     net_edge = fair_up * (1 - TAKER_FEE) - limit
                     label    = f"{asset} UP {time_str} ET (hourly)"
-                    if (net_edge >= MIN_HOURLY_EDGE
+                    if limit > MAX_HOURLY_ENTRY_PRICE:
+                        log.info(f"    Skip {asset} UP: entry {limit:.2f} > "
+                                 f"{MAX_HOURLY_ENTRY_PRICE:.2f} cap — move already priced")
+                    elif (net_edge >= MIN_HOURLY_EDGE
                             and not om.has_open_order(token_up)
                             and not om.already_holds(token_up)
                             and om.market_exposure_usdc(token_up) < min(MAX_MARKET_EXPOSURE, bankroll * 0.12)):
@@ -2849,6 +2913,9 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float,
                 log.info(f"    Skip {asset} DOWN: news bullish ({news_score:+.2f})")
             elif dn_on_cd:
                 log.info(f"    Skip {asset} DOWN: loss cooldown active")
+            elif _dir_streak_blocked("DOWN"):
+                log.info(f"    Skip {asset} DOWN: {DIR_STREAK_N}+ DOWN losses across assets "
+                         f"in {DIR_STREAK_WINDOW//3600}h — direction brake")
             else:
                 bid_dn, ask_dn, book_mid_dn, liquid_dn = get_order_book(token_down)
                 if not liquid_dn:
@@ -2862,7 +2929,10 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float,
                     limit    = min(limit, ask_dn)  # allow taker fill when fair > ask
                     net_edge = fair_down * (1 - TAKER_FEE) - limit
                     label    = f"{asset} DOWN {time_str} ET (hourly)"
-                    if (net_edge >= MIN_HOURLY_EDGE
+                    if limit > MAX_HOURLY_ENTRY_PRICE:
+                        log.info(f"    Skip {asset} DOWN: entry {limit:.2f} > "
+                                 f"{MAX_HOURLY_ENTRY_PRICE:.2f} cap — move already priced")
+                    elif (net_edge >= MIN_HOURLY_EDGE
                             and not om.has_open_order(token_down)
                             and not om.already_holds(token_down)
                             and om.market_exposure_usdc(token_down) < min(MAX_MARKET_EXPOSURE, bankroll * 0.12)):
