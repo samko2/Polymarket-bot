@@ -1974,9 +1974,17 @@ def place_order(client: ClobClient, om: OrderManager,
     if DRY_RUN:
         # Record hourly entries so they can be settled against the real hourly
         # candle later — see _settle_paper_trades().
+        # DEDUPE: this early return happens before om.record(), so the order
+        # manager never learns about a simulated position and every later cycle
+        # re-enters the same market. Left unchecked one hour is "bought" for as
+        # long as it stays open, and the accuracy sample ends up weighted by how
+        # long a market lived rather than by independent decisions.
+        if any(t["token_id"] == token_id for t in _paper_open):
+            return False
         m = re.match(r"([A-Z]+)\s+(UP|DOWN)\b", label or "")
         if m and market_end > 0:
-            _paper_open.append({"label": label, "asset": m.group(1), "side": m.group(2),
+            _paper_open.append({"token_id": token_id, "label": label,
+                                "asset": m.group(1), "side": m.group(2),
                                 "entry": limit, "size": size_usdc, "market_end": market_end})
         return True
 
@@ -3474,7 +3482,11 @@ def run_loop(client: ClobClient, wallet: str) -> None:
         bankroll = MANUAL_BANKROLL
         log.info(f"  Using manual bankroll: ${bankroll:.2f}")
     else:
-        bankroll = get_usdc_balance(client, wallet) if not DRY_RUN else MAX_BET_USDC * 20
+        # Paper mode uses the REAL balance too (a read-only call). The old
+        # MAX_BET_USDC*20 = $160 stand-in inflated Kelly sizing ~3x against the
+        # actual ~$52, so simulated P&L would not have been comparable to what
+        # live trading of the same signals would earn.
+        bankroll = get_usdc_balance(client, wallet)
     last_reset = time.time()
 
     log.info(f"Loop started. Balance: ${bankroll:.2f}  Positions loaded: {len(om.held_token_ids)}")
