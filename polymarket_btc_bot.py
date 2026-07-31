@@ -3531,7 +3531,11 @@ def run_loop(client: ClobClient, wallet: str) -> None:
         global _effective_kelly, _dd_mult
         portfolio = bankroll + (0.0 if DRY_RUN else get_position_value(wallet))
         _dd_guard.update(portfolio)
-        _dd_mult = _dd_guard.kelly_multiplier(portfolio)  # cached for kelly_buy per-type calc
+        # In paper mode the drawdown multiplier is forced to 1.0: a paused guard
+        # returns 0.0, which would size every simulated bet to zero and collect
+        # no sample at all. Real capital is not at stake here, and the win-rate
+        # multiplier below still responds to paper results as they land.
+        _dd_mult = 1.0 if DRY_RUN else _dd_guard.kelly_multiplier(portfolio)
         dd_mult  = _dd_mult
         wr_mult  = _wr_tracker.kelly_multiplier()         # "all" — for display only
         _effective_kelly = round(KELLY_FRACTION * dd_mult * wr_mult, 4)
@@ -3572,7 +3576,7 @@ def run_loop(client: ClobClient, wallet: str) -> None:
         # warning spammed the logs every 10s. Now the cycle runs normally with
         # entries blocked at place_order, and the warning logs every 10 min.
         global _entries_blocked
-        if _dd_guard.is_paused:
+        if _dd_guard.is_paused and not DRY_RUN:
             if time.time() - _last_pause_log[0] > 600:
                 _last_pause_log[0] = time.time()
                 log.warning(f"  🚨 Entries paused (drawdown). "
@@ -3622,7 +3626,15 @@ def run_loop(client: ClobClient, wallet: str) -> None:
         session_guard_active = (session_start_bankroll == 0.0 and
                                 portfolio < pnl.last_portfolio * 0.75)
         # Single switch all scanners share via place_order
-        _entries_blocked = _dd_guard.is_paused or session_guard_active
+        # Loss guards never gate PAPER trading. Their job is protecting real
+        # capital; in DRY_RUN there is none, and halting only starves the very
+        # sample the paper run exists to collect. (Observed: the pre-fix build
+        # saved a $160 stand-in bankroll as the paper peak, so the first boot on
+        # the real $52 balance read a 67% drawdown and paused immediately —
+        # the experiment would have produced zero settled trades.) A strategy
+        # that would have drawn down badly still shows up, in the accuracy and
+        # P&L scorecard, which is the honest place for it.
+        _entries_blocked = (not DRY_RUN) and (_dd_guard.is_paused or session_guard_active)
 
         if not TRADE_DAILY_MARKETS:
             log.info("Daily markets paused (TRADE_DAILY_MARKETS=False — daily WR 45%)")
