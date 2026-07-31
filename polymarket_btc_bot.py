@@ -62,7 +62,19 @@ CHAIN_ID   = 137
 TICK_SIZE  = "0.01"
 
 # ── Bot config ─────────────────────────────────────────────────────────────────
-DRY_RUN               = False   # LIVE TRADING
+DRY_RUN               = True    # PAPER TRADING — see the block comment below.
+# ─────────────────────────────────────────────────────────────────────────────
+# WHY PAPER MODE (2026-07-31)
+# Backtest of all 181 resolved hourly positions against Binance hourly candles:
+#   • the bot's DIRECTION was right on 85/181 hours = 47.0% — worse than a coin flip
+#   • realized P&L -$55.02; hold-to-expiry counterfactual -$99.40 (so the
+#     stop-losses were HELPING, not hurting — see EXIT_NOTE below)
+# Buying at ~0.53 with 47% accuracy and a 2% taker fee is ≈ -13% expected value
+# per trade by construction. 181 x ~$2.50 x -13% ≈ -$59, which matches the
+# realized -$55. No amount of exit tuning, cooldown or sizing fixes a coin-flip
+# predictor — the loss is structural. Flip back to False only after paper
+# trading shows direction accuracy sustained above ~53%.
+# ─────────────────────────────────────────────────────────────────────────────
 POLL_INTERVAL         = 10      # seconds between scans — faster stop-loss execution
 EDGE_BUFFER           = 0.03    # place limit this far below fair (3%)
 MIN_EDGE              = 0.03    # minimum net edge after fee (raised 2%→3% to match hourly quality bar)
@@ -92,6 +104,9 @@ MANUAL_BANKROLL       = float(os.getenv("MANUAL_BANKROLL", "0"))  # override bal
 # ── Drawdown protection ────────────────────────────────────────────────────────
 DRAWDOWN_WARN_PCT  = 0.20   # 20% from peak → halve Kelly + Telegram alert
 DRAWDOWN_PAUSE_PCT = 0.30   # 30% from peak → halt trading entirely
+PEAK_STALE_DAYS    = 3      # no new high for this long → start decaying the peak
+PEAK_DECAY_PER_DAY = 0.03   # 3% per step, floored at the current portfolio value,
+                            # so a drawdown pause can always be escaped eventually
 
 # ── Rolling win-rate (dynamic Kelly) ──────────────────────────────────────────
 WINRATE_WINDOW     = 20     # look back over last 20 trades — faster adaptation than 30
@@ -978,18 +993,15 @@ def scan_exit_positions(client: ClobClient, om: OrderManager, wallet: str = "") 
             if reason is None:
                 continue
 
-            # ── No stop-losses in the final 20 min (hourly) ────────────────
-            # Near expiry the token trades like a binary and whipsaws hard;
-            # bids are thin and stops fill terribly. Jul 6 9AM: four DOWN
-            # positions stop-lossed at -34..-66% ~15 min before expiry — and
-            # the hour resolved DOWN. Ride it to settlement instead: worst
-            # case is the entry stake, and take-profit/trailing still run.
-            if ("stop-loss" in reason and is_hourly and market_end > 0
-                    and (market_end - now_ts) < 1200):
-                log.info(f"  Hold through stop {token_id[:12]}…: "
-                         f"{(market_end - now_ts)/60:.0f}m to expiry, "
-                         f"letting it resolve instead of selling into a thin book")
-                continue
+            # EXIT_NOTE (2026-07-31): a "hold through the stop in the last
+            # 20 min" rule used to live here. It was added on Jul 8 from four
+            # anecdotes where stopped positions went on to resolve in our
+            # favour. Backtesting all 181 resolved positions killed it:
+            # holding everything to expiry returns -$99.40 vs -$55.02 actually
+            # realized. Of the 135 positions sold out early, only 41% would
+            # have resolved our way — the other 59% would have gone to zero
+            # instead of recovering part of the stake. Stops are worth ~$44
+            # over this sample. Do not re-add without a fresh backtest.
 
             # ── Determine shares to sell ───────────────────────────────────
             shares = round(_get_position_size(wallet, token_id), 2)
@@ -1404,17 +1416,53 @@ class DrawdownGuard:
     """Tracks peak bankroll and reduces / halts trading during drawdown."""
 
     def __init__(self):
-        self.peak   = 0.0
-        self._state = "ok"   # "ok" | "warn" | "pause"
+        self.peak      = 0.0
+        self._state    = "ok"   # "ok" | "warn" | "pause"
+        self._pending  = 0.0    # candidate new high awaiting confirmation
+        self._below_ts = 0.0    # when the portfolio first sat below the peak
 
     def update(self, bankroll: float) -> None:
+        now = time.time()
         if bankroll > self.peak:
+            # Two-sample confirmation before ratcheting the high-water mark.
+            # Portfolio = cash + cached position marks, and during Polymarket's
+            # auto-redeem window a winning position can be counted BOTH as cash
+            # and as a (stale, 240s-cached) position — double-counting it for a
+            # few minutes. A high-water mark makes such a blip permanent: that
+            # is how a real ~$76 peak became a recorded $88.96 and locked the
+            # bot out of trading for three weeks.
+            if self._pending <= 0 or bankroll < self._pending * 0.97:
+                self._pending = bankroll        # first sighting — wait for confirmation
+                return
+            confirmed = min(bankroll, self._pending)
             if self._state != "ok":
-                log.info(f"  ✅ Drawdown guard: recovered to ${bankroll:.2f} "
+                log.info(f"  ✅ Drawdown guard: recovered to ${confirmed:.2f} "
                          f"(was {self._state}, peak=${self.peak:.2f})")
-                tg(f"✅ <b>Drawdown recovered</b>\nBankroll: ${bankroll:.2f}")
-            self.peak   = bankroll
-            self._state = "ok"
+                tg(f"✅ <b>Drawdown recovered</b>\nBankroll: ${confirmed:.2f}")
+            self.peak      = confirmed
+            self._state    = "ok"
+            self._pending  = 0.0
+            self._below_ts = 0.0
+            return
+
+        self._pending = 0.0
+        # ── Anti-lockout: decay a stale peak ──────────────────────────────
+        # The pause lifts at peak x 0.8. If the portfolio can no longer reach
+        # that (entries are blocked, so only open positions can close the gap)
+        # the bot is frozen forever — exactly what happened on 2026-07-31:
+        # portfolio $59.20 vs a $71.17 lift line, with a best-case $62.33.
+        # After PEAK_STALE_DAYS below the high, walk the peak down toward the
+        # current value so the guard always has a reachable exit.
+        if self._below_ts == 0.0:
+            self._below_ts = now
+        elif now - self._below_ts > PEAK_STALE_DAYS * 86400 and self.peak > bankroll:
+            decayed = max(bankroll, self.peak * (1 - PEAK_DECAY_PER_DAY))
+            if decayed < self.peak - 0.01:
+                log.info(f"  📉 Drawdown peak decayed ${self.peak:.2f} → ${decayed:.2f} "
+                         f"(no new high in {PEAK_STALE_DAYS}d — keeps the pause escapable)")
+                self.peak = decayed
+            # step again in a day, not another full stale interval
+            self._below_ts = now - (PEAK_STALE_DAYS - 1) * 86400
         elif (self._state == "pause" and self.peak > 0
                 and bankroll >= self.peak * (1 - DRAWDOWN_WARN_PCT)):
             # Partial recovery back above the warn line: resume at halved Kelly
@@ -1554,6 +1602,12 @@ def _dir_streak_blocked(direction: str) -> bool:
 # Survives process crashes and container restarts within the same Railway deploy.
 # Lost on new deploys (code pushes) — add a Railway Volume for full persistence.
 _STATE_FILE = os.getenv("STATE_FILE", "bot_state.json")
+# Paper trading keeps its own state file. Sharing one would poison the live
+# drawdown peak and win-rate with simulated results — e.g. a DRY_RUN bankroll
+# of $160 becoming the peak, so the first live boot would read a 63% drawdown
+# and pause instantly.
+if DRY_RUN:
+    _STATE_FILE += ".dry"
 
 # Cumulative realized P&L across all sessions (persisted to state file)
 _total_realized_pnl: float = 0.0
@@ -1573,6 +1627,64 @@ _session_baseline: float = 0.0
 # Rate-limiter for the drawdown-pause warning (was one line every 10s,
 # flooding Railway's log window past retrievability)
 _last_pause_log: list = [0.0]
+
+# ── Paper-trading ledger ──────────────────────────────────────────────────────
+# DRY_RUN used to only print "[DRY] BUY …" and drop the trade on the floor:
+# no position, no exit (scan_exit_positions returns early), no outcome. Paper
+# mode therefore could never answer the one question that matters — is the
+# entry signal better than a coin flip? Each simulated entry is recorded here
+# and settled against the Binance hourly candle for the hour the market covers,
+# which is the same method used to backtest the live trades.
+_paper_open:  list = []   # [{label, asset, side, entry, size, market_end}]
+_paper_stats: dict = {"n": 0, "correct": 0, "pnl": 0.0}
+
+
+def _settle_paper_trades() -> None:
+    """Resolve simulated hourly entries whose market has ended; log a scorecard."""
+    if not DRY_RUN or not _paper_open:
+        return
+    now = time.time()
+    still: list = []
+    for t in _paper_open:
+        # +120s so the closing candle is definitely published
+        if now < t["market_end"] + 120:
+            still.append(t)
+            continue
+        sym = HOURLY_ASSETS.get(t["asset"], {}).get("binance")
+        if not sym:
+            continue
+        try:
+            start_ms = int((t["market_end"] - 3600) * 1000)
+            k = retry_get("https://api.binance.com/api/v3/klines",
+                          params={"symbol": sym + "USDT", "interval": "1h",
+                                  "startTime": start_ms, "limit": 1},
+                          timeout=10, attempts=2).json()
+            o, c = float(k[0][1]), float(k[0][4])
+        except Exception:
+            continue   # candle not available yet — drop rather than mis-score
+        actual  = "UP" if c > o else "DOWN"
+        correct = actual == t["side"]
+        # binary payout: win → 1 share is worth $1 (less fee), lose → stake gone
+        pnl = (t["size"] / t["entry"] * (1 - TAKER_FEE) - t["size"]) if correct else -t["size"]
+        _paper_stats["n"]       += 1
+        _paper_stats["correct"] += int(correct)
+        _paper_stats["pnl"]     += pnl
+        _wr_tracker.record_exit(t["label"], won=correct)
+        acc = _paper_stats["correct"] / _paper_stats["n"] * 100
+        log.info(f"  📝 PAPER {'WIN ' if correct else 'LOSS'} {t['label']}  "
+                 f"entry={t['entry']:.2f} actual={actual} {pnl:+.2f} USDC  |  "
+                 f"direction accuracy {_paper_stats['correct']}/{_paper_stats['n']} "
+                 f"= {acc:.1f}%  cumulative {_paper_stats['pnl']:+.2f}")
+        if _paper_stats["n"] % 20 == 0:
+            verdict = ("BEATS the 53% break-even bar" if acc >= 53 else
+                       "still below the ~53% break-even bar — do not go live")
+            log.warning(f"  📊 PAPER SCORECARD after {_paper_stats['n']} trades: "
+                        f"accuracy {acc:.1f}%, P&L {_paper_stats['pnl']:+.2f} USDC — {verdict}")
+            tg(f"📊 <b>Paper scorecard</b> ({_paper_stats['n']} trades)\n"
+               f"Direction accuracy: <b>{acc:.1f}%</b>\n"
+               f"Simulated P&L: {_paper_stats['pnl']:+.2f} USDC\n{verdict}")
+    _paper_open[:] = still
+    _save_state()
 
 
 def record_realized_pnl(pnl_usdc: float, won: bool) -> None:
@@ -1600,6 +1712,8 @@ def _save_state() -> None:
             "total_losses": _total_losses,
             "purged":       list(_purged_tokens)[:500],
             "session_baseline": _session_baseline,
+            "paper_open":   _paper_open[-200:],
+            "paper_stats":  _paper_stats,
             "saved_at":     now,
         }
         with open(_STATE_FILE, "w") as fh:
@@ -1634,6 +1748,9 @@ def _load_state() -> None:
         # Dead-token blacklist + session loss-guard baseline
         _purged_tokens.update(str(t) for t in data.get("purged", []))
         _session_baseline = float(data.get("session_baseline", 0.0))
+        # Paper-trading ledger (DRY_RUN only — separate state file)
+        _paper_open.extend(data.get("paper_open", []) or [])
+        _paper_stats.update(data.get("paper_stats", {}) or {})
         age_h = (now - float(data.get("saved_at", now))) / 3600
         total_trades = _total_wins + _total_losses
         log.info(f"  🔄 State restored (saved {age_h:.1f}h ago): "
@@ -1855,6 +1972,12 @@ def place_order(client: ClobClient, om: OrderManager,
     log.info(f"{'[DRY] ' if DRY_RUN else ''}BUY LIMIT  {label}  {shares}sh @ {limit:.3f}  (${size_usdc:.2f})")
 
     if DRY_RUN:
+        # Record hourly entries so they can be settled against the real hourly
+        # candle later — see _settle_paper_trades().
+        m = re.match(r"([A-Z]+)\s+(UP|DOWN)\b", label or "")
+        if m and market_end > 0:
+            _paper_open.append({"label": label, "asset": m.group(1), "side": m.group(2),
+                                "entry": limit, "size": size_usdc, "market_end": market_end})
         return True
 
     if not _rate_limit_ok():
@@ -2588,9 +2711,16 @@ def compute_hourly_fair(binance_sym: str, spot: float = 0.0, mins_left: float = 
     mom  = _hourly_momentum(binance_sym)
     imb  = _book_imbalance(binance_sym)
     fund = _funding_rate(binance_sym)
-    news = _news_cache.get().get(binance_sym, 0.0) * NEWS_FAIR_NUDGE
+    # News/F&G is deliberately NOT in the hourly fair any more (2026-07-31).
+    # It is a DAILY macro gauge with no 60-minute predictive content, but it
+    # sits at a persistent value (F&G was pinned in Extreme Fear for weeks),
+    # so it acted as a constant ~-2c tilt on fair_up rather than a signal.
+    # Combined with MIN_HOURLY_CONVICTION=0.58 that skewed the gate hard:
+    # an UP entry needed momentum >= +0.05 while DOWN needed only <= -0.029.
+    # Result: 175 of 181 trades were DOWN — the bot was effectively hard-coded
+    # bearish. News still gates entries via the NEWS_VETO_SCORE check.
     fair_mom = max(0.25, min(0.75,
-               0.50 + 2.0 * mom + 0.08 * imb + 50.0 * fund + news))
+               0.50 + 2.0 * mom + 0.08 * imb + 50.0 * fund))
 
     fair_opt   = None
     opt_weight = 0.0
@@ -3465,6 +3595,8 @@ def run_loop(client: ClobClient, wallet: str) -> None:
 
         # ── Exit held positions at take-profit / stop-loss ─────────────────────
         scan_exit_positions(client, om, wallet)
+        # ── Settle simulated entries (paper mode) ─────────────────────────────
+        _settle_paper_trades()
 
         # ── Refresh balance every 45s (cache TTL) ─────────────────────────────
         if not DRY_RUN and MANUAL_BANKROLL == 0:
