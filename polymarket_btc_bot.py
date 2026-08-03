@@ -1638,9 +1638,88 @@ _last_pause_log: list = [0.0]
 _paper_open:  list = []   # [{label, asset, side, entry, size, market_end}]
 _paper_stats: dict = {"n": 0, "correct": 0, "pnl": 0.0}
 
+# ── Shadow predictions ────────────────────────────────────────────────────────
+# The entry gates (consensus >= 2, conviction >= 0.58, edge, price cap) reject
+# almost every hour — correctly, since the model rarely has conviction now that
+# the artificial bearish tilt is gone. But that starves the paper run: no
+# entries means no settled trades means no answer. Shadow mode records the
+# model's directional call for EVERY hourly market scanned, gated or not, and
+# settles it against the real candle. It never places anything; it exists purely
+# to measure whether the signal beats a coin flip, and it builds a sample orders
+# of magnitude faster than waiting for tradeable setups.
+_shadow_open:  list = []
+_shadow_stats: dict = {"n": 0, "correct": 0, "gated_n": 0, "gated_correct": 0}
+
+
+def _record_shadow(token_id: str, asset: str, fair_up: float,
+                   market_end: float, consensus: int, tradeable: bool) -> None:
+    """Log the model's directional call on an hourly market for later scoring."""
+    if not DRY_RUN or market_end <= 0:
+        return
+    if abs(fair_up - 0.50) < 1e-6:
+        return                                    # genuinely no opinion
+    if any(s["token_id"] == token_id for s in _shadow_open):
+        return
+    _shadow_open.append({"token_id": token_id, "asset": asset,
+                         "side": "UP" if fair_up > 0.50 else "DOWN",
+                         "conf": abs(fair_up - 0.50), "consensus": consensus,
+                         "tradeable": tradeable, "market_end": market_end})
+
+
+def _hour_actual(asset: str, market_end: float) -> str | None:
+    """'UP'/'DOWN' for the hour a market covers, from the Binance candle."""
+    sym = HOURLY_ASSETS.get(asset, {}).get("binance")
+    if not sym:
+        return None
+    try:
+        k = retry_get("https://api.binance.com/api/v3/klines",
+                      params={"symbol": sym + "USDT", "interval": "1h",
+                              "startTime": int((market_end - 3600) * 1000), "limit": 1},
+                      timeout=10, attempts=2).json()
+        o, c = float(k[0][1]), float(k[0][4])
+        return "UP" if c > o else "DOWN"
+    except Exception:
+        return None
+
+
+def _settle_shadow() -> None:
+    """Score ungated directional calls — the real read on whether the signal works."""
+    if not DRY_RUN or not _shadow_open:
+        return
+    now = time.time()
+    still: list = []
+    for s in _shadow_open:
+        if now < s["market_end"] + 120:
+            still.append(s)
+            continue
+        actual = _hour_actual(s["asset"], s["market_end"])
+        if actual is None:
+            continue
+        ok = actual == s["side"]
+        _shadow_stats["n"]       += 1
+        _shadow_stats["correct"] += int(ok)
+        if s.get("tradeable"):
+            _shadow_stats["gated_n"]       += 1
+            _shadow_stats["gated_correct"] += int(ok)
+        if _shadow_stats["n"] % 25 == 0:
+            acc = _shadow_stats["correct"] / _shadow_stats["n"] * 100
+            g_n = _shadow_stats["gated_n"]
+            g_acc = (_shadow_stats["gated_correct"] / g_n * 100) if g_n else float("nan")
+            verdict = ("ABOVE the ~53% break-even bar" if acc >= 53 else
+                       "at/below coin-flip — signal has no edge")
+            log.warning(f"  🔮 SHADOW SCORECARD  {_shadow_stats['n']} hours scored: "
+                        f"direction accuracy {acc:.1f}% — {verdict}"
+                        + (f"  |  gate-passing subset: {g_acc:.1f}% of {g_n}" if g_n else ""))
+            tg(f"🔮 <b>Shadow scorecard</b> ({_shadow_stats['n']} hours)\n"
+               f"Direction accuracy: <b>{acc:.1f}%</b>\n"
+               + (f"Gate-passing subset: {g_acc:.1f}% of {g_n}\n" if g_n else "")
+               + verdict)
+    _shadow_open[:] = still
+
 
 def _settle_paper_trades() -> None:
     """Resolve simulated hourly entries whose market has ended; log a scorecard."""
+    _settle_shadow()
     if not DRY_RUN or not _paper_open:
         return
     now = time.time()
@@ -1714,6 +1793,8 @@ def _save_state() -> None:
             "session_baseline": _session_baseline,
             "paper_open":   _paper_open[-200:],
             "paper_stats":  _paper_stats,
+            "shadow_open":  _shadow_open[-300:],
+            "shadow_stats": _shadow_stats,
             "saved_at":     now,
         }
         with open(_STATE_FILE, "w") as fh:
@@ -1751,6 +1832,8 @@ def _load_state() -> None:
         # Paper-trading ledger (DRY_RUN only — separate state file)
         _paper_open.extend(data.get("paper_open", []) or [])
         _paper_stats.update(data.get("paper_stats", {}) or {})
+        _shadow_open.extend(data.get("shadow_open", []) or [])
+        _shadow_stats.update(data.get("shadow_stats", {}) or {})
         age_h = (now - float(data.get("saved_at", now))) / 3600
         total_trades = _total_wins + _total_losses
         log.info(f"  🔄 State restored (saved {age_h:.1f}h ago): "
@@ -1982,6 +2065,11 @@ def place_order(client: ClobClient, om: OrderManager,
         if any(t["token_id"] == token_id for t in _paper_open):
             return False
         m = re.match(r"([A-Z]+)\s+(UP|DOWN)\b", label or "")
+        # Hourly only. "BTC DOWN $50,000 (touch) T=150d NO" also matches the
+        # regex, and a 150-day market settled against one hourly candle is
+        # meaningless — it would just sit in the ledger for five months.
+        if "(hourly)" not in (label or ""):
+            m = None
         if m and market_end > 0:
             _paper_open.append({"token_id": token_id, "label": label,
                                 "asset": m.group(1), "side": m.group(2),
@@ -3004,6 +3092,10 @@ def scan_hourly_markets(client: ClobClient, om: OrderManager, bankroll: float,
                  f"5min={five_min_s:+.3f} news={news_score:+.2f} tod={tod_mult:.2f}  "
                  f"{question[:40]}")
 
+        # Record the model's call before any gate can reject it (paper mode only).
+        _record_shadow(token_up, asset, fair_up, time.time() + mins_left * 60,
+                       consensus, tradeable=(consensus >= 2))
+
         if consensus < 2:
             log.info(f"    Skip {asset} hourly: weak consensus ({consensus}/6 < 2 required)")
             continue
@@ -3811,8 +3903,19 @@ def run_loop(client: ClobClient, wallet: str) -> None:
 
         elapsed   = time.time() - cycle_start
         sleep_for = max(1.0, effective_interval - elapsed)
+        # In paper mode append the running result. Railway only retains a short
+        # log window, so a scorecard that fires every N settlements can scroll
+        # out of reach; putting it on the cycle line means any glance at the
+        # logs shows where the experiment stands.
+        paper_tail = ""
+        if DRY_RUN:
+            sn, cn = _shadow_stats["n"], _shadow_stats["correct"]
+            paper_tail = (f"  |  PAPER shadow {cn}/{sn}="
+                          f"{(cn/sn*100 if sn else 0):.1f}% acc"
+                          f" (pending {len(_shadow_open)})")
         log.info(f"Cycle {elapsed:.1f}s — next in {sleep_for:.0f}s"
-                 f"{' ⚡fast' if near_expiry else ''}  |  {om.summary()}\n{'='*72}")
+                 f"{' ⚡fast' if near_expiry else ''}  |  {om.summary()}"
+                 f"{paper_tail}\n{'='*72}")
 
         try:
             time.sleep(sleep_for)
