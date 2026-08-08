@@ -3910,9 +3910,11 @@ def run_loop(client: ClobClient, wallet: str) -> None:
         paper_tail = ""
         if DRY_RUN:
             sn, cn = _shadow_stats["n"], _shadow_stats["correct"]
+            gn, gc = _shadow_stats.get("gated_n", 0), _shadow_stats.get("gated_correct", 0)
             paper_tail = (f"  |  PAPER shadow {cn}/{sn}="
                           f"{(cn/sn*100 if sn else 0):.1f}% acc"
-                          f" (pending {len(_shadow_open)})")
+                          + (f"  gated {gc}/{gn}={gc/gn*100:.1f}%" if gn else "")
+                          + f" (pending {len(_shadow_open)})")
         log.info(f"Cycle {elapsed:.1f}s — next in {sleep_for:.0f}s"
                  f"{' ⚡fast' if near_expiry else ''}  |  {om.summary()}"
                  f"{paper_tail}\n{'='*72}")
